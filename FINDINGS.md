@@ -41,4 +41,10 @@ set contexts up as separate locals meanwhile, a reshaping to be undone when this
    private `src/` headers. There is no root kept private to the library's own files.
 7. An accessor returning a slice of self takes `*self`, so each match arm copies the value first.
 
-**Status: reported to `sysl`.**
+**Status: 1–6 accepted for alpha.14; 7 is queued.**
+- vendored-c round 2 covers 1, 3 and 6 (`include_private`).
+- `lib-override` and `target-deps` cover 2.
+- `aggregate-copy` covers 4: large copies become memcpy or sret.
+- `tests-files` covers 5.
+
+The separate-locals reshape from 4 comes out when alpha.14 ships.
