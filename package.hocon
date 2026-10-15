@@ -25,7 +25,8 @@ package {
 c {
   bearssl {
     root    = "c/bearssl"
-    include = ["src", "inc"]
+    include         = ["inc"]
+    include_private = ["src"]
     sources = ["src/**/*.c"]
     defines { BR_USE_URANDOM = 0, BR_USE_GETENTROPY = 0 }
   }
