@@ -1,0 +1,92 @@
+module sh.sysl.bearssl
+@tests
+@requires(heap, os)
+
+import sysl.encoding.{hex_decode, hex_string}
+
+// The hashes against the published vectors: FIPS 180-2's own examples (Appendices A to D: "abc", the
+// 448-bit and 896-bit messages, a million "a"), and the empty message from NIST's CAVP byte-oriented
+// short-message files. Each is compared byte for byte, as hex.
+
+// The bytes a hex string spells. Test-only: it allocates.
+unhex(text: string) -> []u8
+    var out: []u8 = [0; text.len / 2]
+    hex_decode(text.bytes, out).unwrap()
+    out
+
+hex_of(hash: Hash, bytes: []const u8) -> string
+    var out: [64]u8 = [0; 64]
+    val n = hash_of(hash, bytes, out[..]).unwrap()
+    hex_string(out[0..<n])
+
+val ABC: string = "abc"
+val M448: string = "abcdbcdecdefdefgefghfghighijhijkijkljklmklmnlmnomnopnopq"
+val M896: string ="abcdefghbcdefghicdefghijdefghijkefghijklfghijklmghijklmnhijklmnoijklmnopjklmnopqklmnopqrlmnopqrsmnopqrstnopqrstu"
+
+@test("SHA-1 matches FIPS 180-2 and CAVP")
+sha1_vectors()
+    assert_eq(hex_of(Hash.Sha1, ABC.bytes), "a9993e364706816aba3e25717850c26c9cd0d89d")
+    assert_eq(hex_of(Hash.Sha1, M448.bytes), "84983e441c3bd26ebaae4aa1f95129e5e54670f1")
+    assert_eq(hex_of(Hash.Sha1, "".bytes), "da39a3ee5e6b4b0d3255bfef95601890afd80709")
+
+@test("SHA-224 matches FIPS 180-2 and CAVP")
+sha224_vectors()
+    assert_eq(hex_of(Hash.Sha224, ABC.bytes), "23097d223405d8228642a477bda255b32aadbce4bda0b3f7e36c9da7")
+    assert_eq(hex_of(Hash.Sha224, M448.bytes), "75388b16512776cc5dba5da1fd890150b0c6455cb4f58b1952522525")
+    assert_eq(hex_of(Hash.Sha224, "".bytes), "d14a028c2a3a2bc9476102bb288234c415a2b01f828ea62ac5b3e42f")
+
+@test("SHA-256 matches FIPS 180-2 and CAVP")
+sha256_vectors()
+    assert_eq(hex_of(Hash.Sha256, ABC.bytes), "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad")
+    assert_eq(hex_of(Hash.Sha256, M448.bytes), "248d6a61d20638b8e5c026930c3e6039a33ce45964ff2167f6ecedd419db06c1")
+    assert_eq(hex_of(Hash.Sha256, "".bytes), "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855")
+
+@test("SHA-384 matches FIPS 180-2 and CAVP")
+sha384_vectors()
+    assert_eq(hex_of(Hash.Sha384, ABC.bytes), "cb00753f45a35e8bb5a03d699ac65007272c32ab0eded1631a8b605a43ff5bed8086072ba1e7cc2358baeca134c825a7")
+    assert_eq(hex_of(Hash.Sha384, M896.bytes), "09330c33f71147e83d192fc782cd1b4753111b173b3b05d22fa08086e3b0f712fcc7c71a557e2db966c3e9fa91746039")
+    assert_eq(hex_of(Hash.Sha384, "".bytes), "38b060a751ac96384cd9327eb1b1e36a21fdb71114be07434c0cc7bf63f6e1da274edebfe76f65fbd51ad2f14898b95b")
+
+@test("SHA-512 matches FIPS 180-2 and CAVP")
+sha512_vectors()
+    assert_eq(hex_of(Hash.Sha512, ABC.bytes), "ddaf35a193617abacc417349ae20413112e6fa4e89a97ea20a9eeee64b55d39a2192992a274fc1a836ba3c23a3feebbd454d4423643ce80e2a9ac94fa54ca49f")
+    assert_eq(hex_of(Hash.Sha512, M896.bytes), "8e959b75dae313da8cf4f72814fc143f8f7779c6eb9f7fa17299aeadb6889018501d289e4900f7e4331b99dec4b5433ac7d329eeb6dd26545e96e55b874be909")
+    assert_eq(hex_of(Hash.Sha512, "".bytes), "cf83e1357eefb8bdf1542850d66d8007d620e4050b5715dc83f4a921d36ce9ce47d0d13c5d85f2b0ff8318d2877eec2f63b931bd47417a81a538327af927da3e")
+
+@test("a million 'a', fed in uneven pieces, matches FIPS 180-2's long-message vectors")
+million_a()
+    val piece: [997]u8 = [97; 997]
+    var d1 = digest(Hash.Sha1)
+    var d256 = digest(Hash.Sha256)
+    var d512 = digest(Hash.Sha512)
+    var left = 1000000usize
+    while left > 0
+        val n = if left < 997 then left else 997
+        d1.update(piece[0..<n])
+        d256.update(piece[0..<n])
+        d512.update(piece[0..<n])
+        left -= n
+    var out: [64]u8 = [0; 64]
+    assert_eq(hex_string(out[0..<d1.finish(out[..]).unwrap()]), "34aa973cd4c4daa4f61eeb2bdbad27316534016f")
+    assert_eq(hex_string(out[0..<d256.finish(out[..]).unwrap()]), "cdc76e5c9914fb9281a1c7e284d73e67f1809a48a497200e046d39ccc7112cd0")
+    assert_eq(hex_string(out[0..<d512.finish(out[..]).unwrap()]), "e718483d0ce769644e2e42c7bc15b4638e1f98b13b2044285632a803afa973ebde0ff244877ea60a4cb0432ce577c31beb009c5c2c49aa2e4eadb217ad8cc09b")
+
+@test("a digest is not ended by finish, and a copy forks it")
+digest_continues()
+    var d = digest(Hash.Sha256)
+    d.update("ab".bytes)
+    var fork = d
+    var out: [32]u8 = [0; 32]
+    d.finish(out[..]).unwrap()
+    d.update("c".bytes)
+    d.finish(out[..]).unwrap()
+    assert_eq(hex_string(out[..]), "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad")
+    fork.update("c".bytes)
+    fork.finish(out[..]).unwrap()
+    assert_eq(hex_string(out[..]), "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad")
+
+@test("an output shorter than the hash is refused, and nothing is written")
+digest_too_small()
+    var out: [31]u8 = [7; 31]
+    assert_eq(hash_of(Hash.Sha256, "abc".bytes, out[..]).unwrap_err().code, TOO_SMALL)
+    assert_eq(out[0], 7)

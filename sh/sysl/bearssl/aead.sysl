@@ -1,0 +1,101 @@
+// Authenticated encryption: AES-GCM and ChaCha20-Poly1305.
+//
+// **Both work in place.** `seal` encrypts `data` where it lies and writes the 16-byte tag; `open`
+// decrypts it where it lies and checks the tag. **A failed `open` wipes `data`**, so plaintext that
+// did not authenticate never reaches the caller — BearSSL decrypts before it can compare tags, and
+// the binding zeroes what it decrypted.
+//
+// Both use BearSSL's constant-time implementations (`aes_ct`, `ghash_ctmul`, `chacha20_ct`,
+// `poly1305_ctmul`), which are the portable ones a microcontroller runs.
+
+module sh.sysl.bearssl
+
+import sh.sysl.bearssl.c
+import sysl.slices.{as_mut_ptr, as_ptr, fill}
+
+private const AES_CTR_WORDS: usize = (c.AES_CTR_SIZE + 7) / 8
+private const GCM_WORDS: usize = (c.GCM_SIZE + 7) / 8
+
+// The length of every tag here.
+const TAG_SIZE: usize = 16
+
+// Encrypt `data` in place under AES-GCM and write the tag into `tag`.
+//
+// `key` is 16, 24 or 32 bytes (AES-128, -192, -256). `iv` may be any non-empty length; 12 bytes is the
+// length GCM is designed around and the only one TLS uses. **An IV must never repeat under one key.**
+gcm_seal(key: []const u8, iv: []const u8, aad: []const u8, data: []u8, tag: []u8) -> Result[unit, Error]
+    if tag.len != TAG_SIZE then return fail(BAD_LENGTH)
+
+    var keys: [AES_CTR_WORDS]u64 = [0; AES_CTR_WORDS]
+    var gcm: [GCM_WORDS]u64 = [0; GCM_WORDS]
+    val ctx: *c.Gcm = ptr_cast(&gcm[0])
+
+    gcm_start(&keys, ctx, key, iv, aad)?
+    c.gcm_run(ctx, 1, as_mut_ptr(data), data.len)
+    c.gcm_get_tag(ctx, as_mut_ptr(tag))
+    Ok(())
+end gcm_seal
+
+// Decrypt `data` in place under AES-GCM, if `tag` authenticates it; otherwise wipe `data` and answer
+// `AUTH_FAILED`.
+gcm_open(key: []const u8, iv: []const u8, aad: []const u8, data: []u8, tag: []const u8) -> Result[unit, Error]
+    if tag.len != TAG_SIZE then return fail(BAD_LENGTH)
+
+    var keys: [AES_CTR_WORDS]u64 = [0; AES_CTR_WORDS]
+    var gcm: [GCM_WORDS]u64 = [0; GCM_WORDS]
+    val ctx: *c.Gcm = ptr_cast(&gcm[0])
+
+    gcm_start(&keys, ctx, key, iv, aad)?
+    c.gcm_run(ctx, 0, as_mut_ptr(data), data.len)
+
+    if c.gcm_check_tag(ctx, as_ptr(tag)) == 1 then return Ok(())
+
+    fill(data, 0)
+    fail(AUTH_FAILED)
+end gcm_open
+
+// Key the cipher, start GCM and absorb the associated data. The GCM context keeps the address of the
+// key schedule, so both live in the caller's frame for the whole run.
+private gcm_start(keys: *[AES_CTR_WORDS]u64, ctx: *c.Gcm, key: []const u8, iv: []const u8,
+                  aad: []const u8) -> Result[unit, Error]
+    if key.len != 16 && key.len != 24 && key.len != 32 then return fail(BAD_LENGTH)
+    if iv.len == 0 then return fail(BAD_LENGTH)
+
+    val k: *c.AesCtr = ptr_cast(&keys[0])
+
+    c.aes_ct_ctr_init(k, as_ptr(key), key.len)
+    c.gcm_init(ctx, ptr_cast(k), &c.ghash_ctmul)
+    c.gcm_reset(ctx, as_ptr(iv), iv.len)
+    c.gcm_aad_inject(ctx, as_ptr(aad), aad.len)
+    c.gcm_flip(ctx)
+    Ok(())
+end gcm_start
+
+// Encrypt `data` in place under ChaCha20-Poly1305 (RFC 8439) and write the tag into `tag`.
+//
+// `key` is 32 bytes and `nonce` 12. **A nonce must never repeat under one key.**
+chacha20_poly1305_seal(key: []const u8, nonce: []const u8, aad: []const u8, data: []u8,
+                       tag: []u8) -> Result[unit, Error]
+    if key.len != 32 || nonce.len != 12 || tag.len != TAG_SIZE then return fail(BAD_LENGTH)
+
+    c.poly1305_ctmul_run(as_ptr(key), as_ptr(nonce), as_mut_ptr(data), data.len, as_ptr(aad), aad.len,
+                         as_mut_ptr(tag), &c.chacha20_ct_run, 1)
+    Ok(())
+end chacha20_poly1305_seal
+
+// Decrypt `data` in place under ChaCha20-Poly1305, if `tag` authenticates it; otherwise wipe `data`
+// and answer `AUTH_FAILED`.
+chacha20_poly1305_open(key: []const u8, nonce: []const u8, aad: []const u8, data: []u8,
+                       tag: []const u8) -> Result[unit, Error]
+    if key.len != 32 || nonce.len != 12 || tag.len != TAG_SIZE then return fail(BAD_LENGTH)
+
+    var computed: [16]u8 = [0; 16]
+
+    c.poly1305_ctmul_run(as_ptr(key), as_ptr(nonce), as_mut_ptr(data), data.len, as_ptr(aad), aad.len,
+                         &computed[0], &c.chacha20_ct_run, 0)
+
+    if same(computed[..], tag) then return Ok(())
+
+    fill(data, 0)
+    fail(AUTH_FAILED)
+end chacha20_poly1305_open

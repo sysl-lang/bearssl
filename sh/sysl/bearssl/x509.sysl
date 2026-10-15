@@ -1,0 +1,251 @@
+// Certificates: the trust anchors a client validates a server against, and the chain and key a server
+// presents.
+//
+// **Both are stores with their room in their type**, `TrustAnchors[N, BYTES]` and `Identity[BYTES]`:
+// what BearSSL keeps of a certificate (a name, a key, the certificate itself) is copied into an array
+// inside the value, and BearSSL is handed pointers into it. **So both must stay where they are once
+// anything has been added**, and so must every TLS context made over them.
+
+module sh.sysl.bearssl
+
+import sh.sysl.bearssl.c
+import sysl.slices.{as_ptr, copy}
+
+private[bearssl] const X509_DEC_WORDS: usize = (c.X509_DEC_SIZE + 7) / 8
+private const SKEY_WORDS_ID: usize = (c.SKEY_SIZE + 7) / 8
+
+// The longest chain an `Identity` holds: the server's certificate and up to three intermediates.
+const MAX_CHAIN: usize = 4
+
+private[bearssl] blank_anchor() -> c.TrustAnchor = c.TrustAnchor(null, 0, 0, c.Pkey(0, c.RsaPublic(null, 0, null, 0)))
+
+// The certificates a client trusts: up to `N` of them, with `BYTES` of room for their names and keys.
+//
+// **An anchor is a name and a key, not a certificate.** BearSSL keeps only what validation needs, so a
+// self-signed certificate of a few hundred bytes costs its subject name and its public key here.
+struct TrustAnchors[const N: usize, const BYTES: usize]
+    private list: [N]c.TrustAnchor
+    private count: usize
+    private store: [BYTES]u8
+    private used: usize
+
+    // How many anchors are held.
+    len(self) -> usize = self.count
+
+    // Trust the certificate `der`.
+    add_der(*self, der: []const u8) -> Result[unit, Error]
+        var dec: [X509_DEC_WORDS]u64 = [0; X509_DEC_WORDS]
+        val ctx: *c.X509Decoder = ptr_cast(&dec[0])
+        var sink = self.room()?
+
+        c.x509_decoder_init(ctx, &sink_append, ptr_cast(&sink))
+        c.x509_decoder_push(ctx, as_ptr(der), der.len)
+        self.take(ctx, &sink)
+    end add_der
+
+    // Trust every certificate in the PEM text `text`, and answer how many there were. Objects of
+    // other kinds are passed over.
+    add_pem(*self, text: []const u8) -> Result[usize, Error]
+        var dec: [X509_DEC_WORDS]u64 = [0; X509_DEC_WORDS]
+        val ctx: *c.X509Decoder = ptr_cast(&dec[0])
+        var pem = pem_reader(text)
+        var added = 0usize
+
+        loop
+            val kind = pem.next()? match
+                None -> return Ok(added)
+                Some(k) -> k
+
+            if kind != PemKind.Certificate
+                pem.skip()?
+                continue
+
+            var sink = self.room()?
+
+            c.x509_decoder_init(ctx, &sink_append, ptr_cast(&sink))
+            pem.feed(&feed_x509, ptr_cast(ctx))?
+            self.take(ctx, &sink)?
+            added += 1
+    end add_pem
+
+    // A sink over the free part of the store, where the decoder writes the subject name.
+    private room(*self) -> Result[Sink, Error]
+        if self.count == N || self.used == BYTES then return fail(NO_ROOM)
+
+        Ok(Sink(&self.store[self.used], BYTES - self.used, 0, false))
+    end room
+
+    // Take the name the decoder collected and the key it found, and make them the next anchor. The key
+    // is copied in after the name, since the decoder's own copy dies with it.
+    private take(*self, ctx: *c.X509Decoder, sink: *Sink) -> Result[unit, Error]
+        val key = public_of(ctx)?
+
+        if sink.over then return fail(NO_ROOM)
+
+        val dn_at = self.used
+        var at = dn_at + sink.len
+        var ta = blank_anchor()
+
+        ta.dn = &self.store[dn_at]
+        ta.dn_len = sink.len
+        ta.flags = if c.x509_decoder_is_ca(ctx) != 0 then c.TA_CA else 0
+
+        key match
+            Ec(found) ->
+                var k = found
+                val q = k.point()
+
+                if at + q.len > BYTES then return fail(NO_ROOM)
+
+                copy(self.store[at..], q)
+
+                var ek: *c.PkeyEc = ptr_cast(&ta.pkey)
+
+                ek.key_type = u8(c.KEYTYPE_EC)
+                ek.ec = c.EcPublic(k.curve.id(), &self.store[at], q.len)
+                at += q.len
+            Rsa(found) ->
+                var k = found
+                val n = k.modulus()
+                val e = k.exponent()
+
+                if at + n.len + e.len > BYTES then return fail(NO_ROOM)
+
+                copy(self.store[at..], n)
+                copy(self.store[at + n.len..], e)
+                ta.pkey = c.Pkey(u8(c.KEYTYPE_RSA), c.RsaPublic(&self.store[at], n.len, &self.store[at + n.len], e.len))
+                at += n.len + e.len
+
+        self.list[self.count] = ta
+        self.count += 1
+        self.used = at
+        Ok(())
+    end take
+
+    private[bearssl] anchors(*self) -> *c.TrustAnchor = &self.list[0]
+end TrustAnchors
+
+// An empty trust store.
+trust_anchors[const N: usize, const BYTES: usize]() -> TrustAnchors[N, BYTES] =
+    TrustAnchors([blank_anchor(); N], 0, [0; BYTES], 0)
+
+private[bearssl] feed_x509(ctx: *u8, src: *u8, len: usize) = c.x509_decoder_push(ptr_cast(ctx), src, len)
+
+// What a server presents: its certificate chain, leaf first, and the private key that goes with the
+// leaf, with `BYTES` of room for the certificates.
+//
+// **The key is held in BearSSL's own decoder**, which is where BearSSL's server code expects to find
+// it, so it is never copied out into a second place.
+struct Identity[const BYTES: usize]
+    private chain: [MAX_CHAIN]c.Certificate
+    private count: usize
+    private store: [BYTES]u8
+    private used: usize
+    private skey: [SKEY_WORDS_ID]u64
+    private key_type: i32
+    private issuer_key_type: i32
+
+    // How many certificates the chain holds.
+    len(self) -> usize = self.count
+
+    // Append the certificate `der` to the chain. The first one added is the server's own.
+    add_certificate(*self, der: []const u8) -> Result[unit, Error]
+        var sink = self.room()?
+
+        for b in der
+            sink_append(ptr_cast(&sink), &b, 1)
+
+        self.keep(&sink)
+    end add_certificate
+
+    // Take the private key `der` (PKCS#8, or the raw RSA or EC form).
+    set_key(*self, der: []const u8) -> Result[unit, Error]
+        c.skey_decoder_init(self.skey_ctx())
+        c.skey_decoder_push(self.skey_ctx(), as_ptr(der), der.len)
+        self.check_key()
+    end set_key
+
+    // Take everything in the PEM text `text`: every certificate, appended to the chain in the order
+    // written, and a private key. Objects of other kinds are passed over.
+    add_pem(*self, text: []const u8) -> Result[unit, Error]
+        var pem = pem_reader(text)
+
+        loop
+            val kind = pem.next()? match
+                None -> return Ok(())
+                Some(k) -> k
+
+            if kind == PemKind.Certificate
+                var sink = self.room()?
+
+                pem.feed(&sink_append, ptr_cast(&sink))?
+                self.keep(&sink)?
+            else if kind.is_key()
+                c.skey_decoder_init(self.skey_ctx())
+                pem.feed(&feed_skey, ptr_cast(self.skey_ctx()))?
+                self.check_key()?
+            else
+                pem.skip()?
+    end add_pem
+
+    private room(*self) -> Result[Sink, Error]
+        if self.count == MAX_CHAIN || self.used == BYTES then return fail(NO_ROOM)
+
+        Ok(Sink(&self.store[self.used], BYTES - self.used, 0, false))
+    end room
+
+    // Make what the sink collected the next certificate of the chain. The leaf is decoded once more to
+    // learn what kind of key signed it, which BearSSL's ECDHE_ECDSA and ECDH suites need.
+    private keep(*self, sink: *Sink) -> Result[unit, Error]
+        if sink.over then return fail(NO_ROOM)
+
+        val der = self.store[self.used..<self.used + sink.len]
+
+        if self.count == 0
+            var dec: [X509_DEC_WORDS]u64 = [0; X509_DEC_WORDS]
+            val ctx: *c.X509Decoder = ptr_cast(&dec[0])
+
+            c.x509_decoder_init(ctx, &discard, null)
+            c.x509_decoder_push(ctx, as_ptr(der), der.len)
+
+            if c.x509_decoder_last_error(ctx) != 0 then return fail(BAD_CERTIFICATE)
+
+            self.issuer_key_type = c.x509_decoder_signer_key_type(ctx)
+
+        self.chain[self.count] = c.Certificate(&self.store[self.used], sink.len)
+        self.count += 1
+        self.used += sink.len
+        Ok(())
+    end keep
+
+    private check_key(*self) -> Result[unit, Error]
+        if c.skey_decoder_last_error(self.skey_ctx()) != 0
+            self.key_type = 0
+            return fail(BAD_KEY)
+
+        self.key_type = c.skey_decoder_key_type(self.skey_ctx())
+        Ok(())
+    end check_key
+
+    private skey_ctx(*self) -> *c.SkeyDecoder = ptr_cast(&self.skey[0])
+
+    // Set a server context up over this identity: EC or RSA, by the kind of key it holds.
+    private[bearssl] install(*self, sc: *c.ServerCtx) -> Result[unit, Error]
+        if self.count == 0 then return fail(BAD_CERTIFICATE)
+
+        if self.key_type == c.KEYTYPE_EC
+            c.ssl_server_init_full_ec(sc, &self.chain[0], self.count, u32(self.issuer_key_type),
+                                      c.skey_decoder_get_ec(self.skey_ctx()))
+            return Ok(())
+
+        if self.key_type == c.KEYTYPE_RSA
+            c.ssl_server_init_full_rsa(sc, &self.chain[0], self.count, c.skey_decoder_get_rsa(self.skey_ctx()))
+            return Ok(())
+
+        fail(BAD_KEY)
+    end install
+end Identity
+
+// An empty identity.
+identity[const BYTES: usize]() -> Identity[BYTES] =
+    Identity([c.Certificate(null, 0); MAX_CHAIN], 0, [0; BYTES], 0, [0; SKEY_WORDS_ID], 0, 0)

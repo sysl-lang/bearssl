@@ -1,0 +1,96 @@
+module sh.sysl.bearssl
+@tests
+@requires(heap, os)
+
+import sysl.encoding.hex_string
+
+// HMAC against RFC 4231 (SHA-224 to SHA-512) and RFC 2202 (SHA-1), and HKDF against RFC 5869.
+
+mac_hex(hash: Hash, key: []const u8, data: []const u8) -> string
+    var out: [64]u8 = [0; 64]
+    val n = hmac(hash, key, data, out[..]).unwrap()
+    hex_string(out[0..<n])
+
+@test("HMAC matches RFC 4231 test case 1 at every width, and RFC 2202's")
+hmac_case_1()
+    val key: [20]u8 = [0x0b; 20]
+    val data = "Hi There".bytes
+    assert_eq(mac_hex(Hash.Sha1, key[..], data), "b617318655057264e28bc0b6fb378c8ef146be00")
+    assert_eq(mac_hex(Hash.Sha224, key[..], data), "896fb1128abbdf196832107cd49df33f47b4b1169912ba4f53684b22")
+    assert_eq(mac_hex(Hash.Sha256, key[..], data), "b0344c61d8db38535ca8afceaf0bf12b881dc200c9833da726e9376c2e32cff7")
+    assert_eq(mac_hex(Hash.Sha384, key[..], data), "afd03944d84895626b0825f4ab46907f15f9dadbe4101ec682aa034c7cebc59cfaea9ea9076ede7f4af152e8b2fa9cb6")
+    assert_eq(mac_hex(Hash.Sha512, key[..], data), "87aa7cdea5ef619d4ff0b4241a1d6cb02379f4e2ce4ec2787ad0b30545e17cdedaa833b7d6b8a702038b274eaea3f4e4be9d914eeb61f1702e696c203a126854")
+
+@test("HMAC matches RFC 4231 test case 2, a key shorter than the output")
+hmac_case_2()
+    val key = "Jefe".bytes
+    val data = "what do ya want for nothing?".bytes
+    assert_eq(mac_hex(Hash.Sha1, key, data), "effcdf6ae5eb2fa2d27416d5f184df9c259a7c79")
+    assert_eq(mac_hex(Hash.Sha224, key, data), "a30e01098bc6dbbf45690f3a7e9e6d0f8bbea2a39e6148008fd05e44")
+    assert_eq(mac_hex(Hash.Sha256, key, data), "5bdcc146bf60754e6a042426089575c75a003f089d2739839dec58b964ec3843")
+    assert_eq(mac_hex(Hash.Sha384, key, data), "af45d2e376484031617f78d2b58a6b1b9c7ef464f5a01b47e42ec3736322445e8e2240ca5e69e2c78b3239ecfab21649")
+    assert_eq(mac_hex(Hash.Sha512, key, data), "164b7a7bfcf819e2e395fbe73b56e0a387bd64222e831fd610270cd7ea2505549758bf75c05a994a6d034f65f8f0e6fdcaeab1a34d4a6b4b636e070a38bce737")
+
+@test("HMAC matches RFC 4231 test case 3, fifty bytes of 0xdd")
+hmac_case_3()
+    val key: [20]u8 = [0xaa; 20]
+    val data: [50]u8 = [0xdd; 50]
+    assert_eq(mac_hex(Hash.Sha224, key[..], data[..]), "7fb3cb3588c6c1f6ffa9694d7d6ad2649365b0c1f65d69d1ec8333ea")
+    assert_eq(mac_hex(Hash.Sha256, key[..], data[..]), "773ea91e36800e46854db8ebd09181a72959098b3ef8c122d9635514ced565fe")
+    assert_eq(mac_hex(Hash.Sha384, key[..], data[..]), "88062608d3e6ad8a0aa2ace014c8a86f0aa635d947ac9febe83ef4e55966144b2a5ab39dc13814b94e3ab6e101a34f27")
+    assert_eq(mac_hex(Hash.Sha512, key[..], data[..]), "fa73b0089d56a284efb0f0756c890be9b1b5dbdd8ee81a3655f83e33b2279d39bf3e848279a722c806b485a47e67c807b946a337bee8942674278859e13292fb")
+
+@test("HMAC matches RFC 4231 test case 6, a key longer than the block, hashed first")
+hmac_case_6()
+    val key: [131]u8 = [0xaa; 131]
+    val data = "Test Using Larger Than Block-Size Key - Hash Key First".bytes
+    assert_eq(mac_hex(Hash.Sha224, key[..], data), "95e9a0db962095adaebe9b2d6f0dbce2d499f112f2d2b7273fa6870e")
+    assert_eq(mac_hex(Hash.Sha256, key[..], data), "60e431591ee0b67f0d8a26aacbf5b77f8e0bc6213728c5140546040f0ee37f54")
+    assert_eq(mac_hex(Hash.Sha384, key[..], data), "4ece084485813e9088d2c63a041bc5b44f9ef1012a2b588f3cd11f05033ac4c60c2ef6ab4030fe8296248df163f44952")
+    assert_eq(mac_hex(Hash.Sha512, key[..], data), "80b24263c7c1a3ebb71493c1dd7be8b49b46d1f41b4aeec1121b013783f8f3526b56d037e05f2598bd0fd2215d6a1e5295e64f73f63f0aec8b915a985d786598")
+
+@test("a streamed HMAC is the one-shot HMAC, and a short output is refused")
+hmac_streamed()
+    var m = mac(Hash.Sha256, "Jefe".bytes)
+    m.update("what do ya ".bytes)
+    m.update("want for nothing?".bytes)
+    var out: [32]u8 = [0; 32]
+    assert_eq(m.finish(out[..]).unwrap(), 32)
+    assert_eq(hex_string(out[..]), "5bdcc146bf60754e6a042426089575c75a003f089d2739839dec58b964ec3843")
+    var short: [31]u8 = [0; 31]
+    assert_eq(m.finish(short[..]).unwrap_err().code, TOO_SMALL)
+
+@test("HKDF matches RFC 5869 test cases 1 and 3 (SHA-256) and 4 (SHA-1)")
+hkdf_vectors()
+    var okm: [42]u8 = [0; 42]
+    val ikm: [22]u8 = [0x0b; 22]
+    val salt: [13]u8 = [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12]
+    val info: [10]u8 = [0xf0, 0xf1, 0xf2, 0xf3, 0xf4, 0xf5, 0xf6, 0xf7, 0xf8, 0xf9]
+    hkdf(Hash.Sha256, salt[..], ikm[..], info[..], okm[..]).unwrap()
+    assert_eq(hex_string(okm[..]), "3cb25f25faacd57a90434f64d0362f2a2d2d0a90cf1a5a4c5db02d56ecc4c5bf34007208d5b887185865")
+    hkdf(Hash.Sha256, "".bytes, ikm[..], "".bytes, okm[..]).unwrap()
+    assert_eq(hex_string(okm[..]), "8da4e775a563c18f715f802a063c5a31b8a11f5c5ee1879ec3454e5f3c738d2d9d201395faa4b61a96c8")
+    hkdf(Hash.Sha1, salt[..], ikm[0..<11], info[..], okm[..]).unwrap()
+    assert_eq(hex_string(okm[..]), "085a01ea1b10f36933068b56efa5ad81a4f14b822f5b091568a9cdd4f155fda2c22e422478d305f3f896")
+
+@test("HKDF refuses more than 255 blocks of output")
+hkdf_too_long()
+    var okm: []u8 = [0; 255 * 20 + 1]
+    assert_eq(hkdf(Hash.Sha1, "".bytes, "k".bytes, "".bytes, okm).unwrap_err().code, BAD_LENGTH)
+    hkdf(Hash.Sha1, "".bytes, "k".bytes, "".bytes, okm[0..<255 * 20]).unwrap()
+
+@test("the random generator is deterministic in its seed, and refuses a short one")
+random_deterministic()
+    val seed: [32]u8 = [1; 32]
+    var a = random(seed[..]).unwrap()
+    var b = random(seed[..]).unwrap()
+    var x: [40]u8 = [0; 40]
+    var y: [40]u8 = [0; 40]
+    a.fill(x[..])
+    b.fill(y[..])
+    assert_eq(hex_string(x[..]), hex_string(y[..]))
+    b.reseed("more".bytes)
+    a.fill(x[..])
+    b.fill(y[..])
+    assert(hex_string(x[..]) != hex_string(y[..]))
+    assert_eq(random(seed[0..<31]).unwrap_err().code, SEED_TOO_SHORT)

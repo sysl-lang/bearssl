@@ -1,0 +1,134 @@
+module sh.sysl.bearssl
+@tests
+@requires(heap, os)
+
+import sysl.encoding.hex_string
+
+// RSA, PEM and certificate decoding against OpenSSL's output for the same keys: PKCS#1 v1.5 signing is
+// deterministic, so BearSSL's signature must be OpenSSL's byte for byte, and each must verify the
+// other's.
+
+sha(hash: Hash, text: string) -> []u8
+    var out: []u8 = [0; hash.size()]
+    hash_of(hash, text.bytes, out).unwrap()
+    out
+
+rsa_key() -> RsaPrivateKey = private_key_pem(RSA_KEY.bytes).unwrap() match
+    Rsa(k) -> k
+    Ec(_) -> panic("RSA_KEY decoded as an EC key")
+
+ec_key() -> EcPrivateKey = private_key_pem(EC_KEY.bytes).unwrap() match
+    Ec(k) -> k
+    Rsa(_) -> panic("EC_KEY decoded as an RSA key")
+
+@test("an RSA signature from a PEM key is OpenSSL's, byte for byte, with SHA-256 and SHA-384")
+rsa_sign_matches_openssl()
+    var key = rsa_key()
+    assert_eq(key.size(), 256)
+    var sig: [512]u8 = [0; 512]
+    val n = key.sign(Hash.Sha256, sha(Hash.Sha256, "sample"), sig[..]).unwrap()
+    assert_eq(hex_string(sig[0..<n]), RSA_SIG_SHA256)
+    val m = key.sign(Hash.Sha384, sha(Hash.Sha384, "sample"), sig[..]).unwrap()
+    assert_eq(hex_string(sig[0..<m]), RSA_SIG_SHA384)
+
+@test("OpenSSL's RSA signature verifies under the public key derived from the private one, and a changed one does not")
+rsa_verify_openssl()
+    var key = rsa_key()
+    var pk = key.public_key().unwrap()
+    assert_eq(hex_string(pk.modulus()), RSA_MODULUS)
+    assert_eq(hex_string(pk.exponent()), "010001")
+    var sig = unhex(RSA_SIG_SHA256)
+    assert(pk.verify(Hash.Sha256, sha(Hash.Sha256, "sample"), sig))
+    assert(!pk.verify(Hash.Sha384, sha(Hash.Sha384, "sample"), sig))
+    assert(!pk.verify(Hash.Sha256, sha(Hash.Sha256, "samplf"), sig))
+    sig[100] ^= 4
+    assert(!pk.verify(Hash.Sha256, sha(Hash.Sha256, "sample"), sig))
+
+@test("the certificate's public key is the private key's: RSA from RSA_CERT, the EC point from EC_CERT")
+certificate_keys()
+    var pem = pem_reader(RSA_CERT.bytes)
+    assert(pem.next().unwrap().unwrap() == PemKind.Certificate)
+    var der: [2048]u8 = [0; 2048]
+    val n = pem.read(der[..]).unwrap()
+    assert(pem.next().unwrap().is_none())
+    certificate_public_key(der[0..<n]).unwrap() match
+        Rsa(k) ->
+            var key = k
+            assert_eq(hex_string(key.modulus()), RSA_MODULUS)
+        Ec(_) -> panic("RSA_CERT carries an EC key")
+    var pem2 = pem_reader(EC_CERT.bytes)
+    pem2.next().unwrap()
+    val m = pem2.read(der[..]).unwrap()
+    certificate_public_key(der[0..<m]).unwrap() match
+        Ec(k) ->
+            var key = k
+            assert(key.curve == Curve.P256)
+            assert_eq(hex_string(key.point()), EC_POINT)
+        Rsa(_) -> panic("EC_CERT carries an RSA key")
+
+@test("OpenSSL's ECDSA signature (DER, random nonce) verifies under the key in EC_CERT, and BearSSL's verifies too")
+ecdsa_openssl_signature()
+    var key = ec_key()
+    var pk = key.public_key()
+    assert_eq(hex_string(pk.point()), EC_POINT)
+    val h = sha(Hash.Sha256, "sample")
+    var sig = unhex(EC_SIG_DER)
+    assert(pk.verify_der(h, sig))
+    sig[10] ^= 1
+    assert(!pk.verify_der(h, sig))
+    var mine: [80]u8 = [0; 80]
+    val n = key.sign_der(Hash.Sha256, h, mine[..]).unwrap()
+    assert(pk.verify_der(h, mine[0..<n]))
+
+@test("PEM walks several objects, skips the ones it is told to, and refuses a corrupt one")
+pem_walk()
+    val text = s"junk before\n${EC_KEY}between\n${EC_CERT}${OTHER_CERT}"
+    var pem = pem_reader(text.bytes)
+    assert(pem.next().unwrap().unwrap() == PemKind.EcPrivateKey)
+    pem.skip().unwrap()
+    var der: [1024]u8 = [0; 1024]
+    assert(pem.next().unwrap().unwrap() == PemKind.Certificate)
+    val a = pem.read(der[..]).unwrap()
+    assert_eq(der[0], 0x30)
+    assert(pem.next().unwrap().unwrap() == PemKind.Certificate)
+    val b = pem.read(der[..]).unwrap()
+    assert_eq(a, b)
+    assert(pem.next().unwrap().is_none())
+    var small = pem_reader(EC_CERT.bytes)
+    small.next().unwrap()
+    assert_eq(small.read(der[0..<100]).unwrap_err().code, TOO_SMALL)
+    val broken = "-----BEGIN CERTIFICATE-----\nMIIB!!!!\n-----END CERTIFICATE-----\n"
+    var bad = pem_reader(broken.bytes)
+    val first = bad.next()
+    if first.is_ok() then assert_eq(bad.read(der[..]).unwrap_err().code, BAD_PEM)
+
+@test("a private key that is not one is refused")
+bad_private_key()
+    assert_eq(private_key_pem(EC_CERT.bytes).unwrap_err().code, BAD_KEY)
+    var junk: [40]u8 = [0x30; 40]
+    assert_eq(private_key(junk[..]).unwrap_err().code, BAD_KEY)
+
+@test("a trust store takes every certificate in a PEM text, and refuses what does not fit")
+trust_store()
+    var anchors: TrustAnchors[4, 2048] = trust_anchors()
+    assert_eq(anchors.add_pem(s"${EC_CERT}${RSA_CERT}${EC_KEY}".bytes).unwrap(), 2)
+    assert_eq(anchors.len(), 2)
+    var full: TrustAnchors[1, 2048] = trust_anchors()
+    assert_eq(full.add_pem(s"${EC_CERT}${OTHER_CERT}".bytes).unwrap_err().code, NO_ROOM)
+    assert_eq(full.len(), 1)
+    var tiny: TrustAnchors[4, 40] = trust_anchors()
+    assert_eq(tiny.add_pem(EC_CERT.bytes).unwrap_err().code, NO_ROOM)
+    assert_eq(tiny.len(), 0)
+
+@test("an identity takes a chain and a key from PEM, of either kind, and refuses a corrupt certificate")
+identity_store()
+    var ec: Identity[4096] = identity()
+    ec.add_pem(s"${EC_CERT}${EC_KEY}".bytes).unwrap()
+    assert_eq(ec.len(), 1)
+    var rsa: Identity[4096] = identity()
+    rsa.add_pem(s"${RSA_KEY}${RSA_CERT}".bytes).unwrap()
+    assert_eq(rsa.len(), 1)
+    var bad: Identity[4096] = identity()
+    var junk: [40]u8 = [0x30; 40]
+    assert_eq(bad.add_certificate(junk[..]).unwrap_err().code, BAD_CERTIFICATE)
+    assert_eq(bad.set_key(junk[..]).unwrap_err().code, BAD_KEY)

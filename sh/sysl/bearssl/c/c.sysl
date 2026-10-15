@@ -1,0 +1,388 @@
+// BearSSL as C declares it.
+//
+// **Nothing here is meant to be called by a program.** Every buffer is a pointer and a length, every
+// answer is a number, and every context is storage whose address BearSSL keeps. The modules above
+// turn those into slices, `Result`s and methods, and are what an application imports.
+//
+// Each declaration was read out of `c/bearssl/inc/bearssl_*.h`. BearSSL's contexts are its own
+// business, so sysl holds each as words of the size the header says (`c const` below) and never looks
+// inside. The few structures sysl does fill in itself (keys, a trust anchor, a certificate) are
+// declared field for field and checked against the header's `sizeof` and `offsetof` when the package
+// compiles, for whichever target that is.
+//
+// A handful of BearSSL's functions are `static inline` in its headers and have no symbol; `shim.c`
+// beside this file calls each once, and the `sysl_br_` names below are those wrappers.
+
+module sh.sysl.bearssl.c
+
+@include("bearssl.h")
+@include("stddef.h")
+
+// -- what the contexts measure ---------------------------------------------------------------------
+
+c const
+    HASH_SIZE:     usize = "sizeof(br_hash_compat_context)"
+    HMAC_KEY_SIZE: usize = "sizeof(br_hmac_key_context)"
+    HMAC_SIZE:     usize = "sizeof(br_hmac_context)"
+    HKDF_SIZE:     usize = "sizeof(br_hkdf_context)"
+    AES_CTR_SIZE:  usize = "sizeof(br_aes_ct_ctr_keys)"
+    GCM_SIZE:      usize = "sizeof(br_gcm_context)"
+    DRBG_SIZE:     usize = "sizeof(br_hmac_drbg_context)"
+    PEM_SIZE:      usize = "sizeof(br_pem_decoder_context)"
+    X509_DEC_SIZE: usize = "sizeof(br_x509_decoder_context)"
+    SKEY_SIZE:     usize = "sizeof(br_skey_decoder_context)"
+    X509_MIN_SIZE: usize = "sizeof(br_x509_minimal_context)"
+    CLIENT_SIZE:   usize = "sizeof(br_ssl_client_context)"
+    SERVER_SIZE:   usize = "sizeof(br_ssl_server_context)"
+
+// The strongest alignment any of them asks for. Each is held as an array of `u64`, which gives 8.
+c const
+    MAX_ALIGN: usize = "_Alignof(br_ssl_client_context) > _Alignof(br_ssl_server_context) ? _Alignof(br_ssl_client_context) : _Alignof(br_ssl_server_context)"
+    GCM_ALIGN: usize = "_Alignof(br_gcm_context)"
+    X509_MIN_ALIGN: usize = "_Alignof(br_x509_minimal_context)"
+    SKEY_ALIGN: usize = "_Alignof(br_skey_decoder_context)"
+
+// A client or server context begins with its engine, which is why one address serves both.
+c const
+    CLIENT_ENGINE: usize = "offsetof(br_ssl_client_context, eng)"
+    SERVER_ENGINE: usize = "offsetof(br_ssl_server_context, eng)"
+
+// Opaque stand-ins, so a pointer to one says which context it is.
+struct Engine
+    private word: u64
+
+struct ClientCtx
+    private word: u64
+
+struct ServerCtx
+    private word: u64
+
+struct X509Minimal
+    private word: u64
+
+struct X509Decoder
+    private word: u64
+
+struct SkeyDecoder
+    private word: u64
+
+struct PemDecoder
+    private word: u64
+
+struct HashCtx
+    private word: u64
+
+struct HmacKey
+    private word: u64
+
+struct Hmac
+    private word: u64
+
+struct Hkdf
+    private word: u64
+
+struct AesCtr
+    private word: u64
+
+struct Gcm
+    private word: u64
+
+struct Drbg
+    private word: u64
+
+// A vtable BearSSL hands around by address: a hash, a block cipher in CTR mode, a curve
+// implementation. sysl only ever takes the address of one.
+struct HashClass
+    private word: u64
+
+struct CtrClass
+    private word: u64
+
+struct EcImpl
+    private word: u64
+
+// -- the structures sysl fills in ------------------------------------------------------------------
+
+struct RsaPublic
+    n: *u8
+    nlen: usize
+    e: *u8
+    elen: usize
+
+struct RsaPrivate
+    n_bitlen: u32
+    p: *u8
+    plen: usize
+    q: *u8
+    qlen: usize
+    dp: *u8
+    dplen: usize
+    dq: *u8
+    dqlen: usize
+    iq: *u8
+    iqlen: usize
+end RsaPrivate
+
+struct EcPublic
+    curve: i32
+    q: *u8
+    qlen: usize
+
+struct EcPrivate
+    curve: i32
+    x: *u8
+    xlen: usize
+
+// `br_x509_pkey`: a key type, then a union of the two kinds. The union is laid down as its larger arm,
+// so `PkeyEc` reads the same storage as the other one.
+struct Pkey
+    key_type: u8
+    rsa: RsaPublic
+
+struct PkeyEc
+    key_type: u8
+    ec: EcPublic
+
+struct TrustAnchor
+    dn: *u8
+    dn_len: usize
+    flags: u32
+    pkey: Pkey
+
+struct Certificate
+    data: *u8
+    len: usize
+
+c const
+    RSA_PUBLIC_SIZE:   usize = "sizeof(br_rsa_public_key)"
+    RSA_PRIVATE_SIZE:  usize = "sizeof(br_rsa_private_key)"
+    RSA_PRIVATE_IQLEN: usize = "offsetof(br_rsa_private_key, iqlen)"
+    EC_PUBLIC_SIZE:    usize = "sizeof(br_ec_public_key)"
+    EC_PUBLIC_QLEN:    usize = "offsetof(br_ec_public_key, qlen)"
+    EC_PRIVATE_SIZE:   usize = "sizeof(br_ec_private_key)"
+    EC_PRIVATE_XLEN:   usize = "offsetof(br_ec_private_key, xlen)"
+    PKEY_SIZE:         usize = "sizeof(br_x509_pkey)"
+    PKEY_RSA:          usize = "offsetof(br_x509_pkey, key.rsa)"
+    PKEY_EC:           usize = "offsetof(br_x509_pkey, key.ec)"
+    TA_SIZE:           usize = "sizeof(br_x509_trust_anchor)"
+    TA_FLAGS:          usize = "offsetof(br_x509_trust_anchor, flags)"
+    TA_PKEY:           usize = "offsetof(br_x509_trust_anchor, pkey)"
+    CERT_SIZE:         usize = "sizeof(br_x509_certificate)"
+    CERT_LEN:          usize = "offsetof(br_x509_certificate, data_len)"
+
+@assert(sizeof(RsaPublic) == RSA_PUBLIC_SIZE, "sysl's RsaPublic is not the size of 'br_rsa_public_key'")
+@assert(sizeof(RsaPrivate) == RSA_PRIVATE_SIZE, "sysl's RsaPrivate is not the size of 'br_rsa_private_key'")
+@assert(offsetof(RsaPrivate, iqlen) == RSA_PRIVATE_IQLEN, "RsaPrivate.iqlen is not where 'br_rsa_private_key' has it")
+@assert(sizeof(EcPublic) == EC_PUBLIC_SIZE, "sysl's EcPublic is not the size of 'br_ec_public_key'")
+@assert(offsetof(EcPublic, qlen) == EC_PUBLIC_QLEN, "EcPublic.qlen is not where 'br_ec_public_key' has it")
+@assert(sizeof(EcPrivate) == EC_PRIVATE_SIZE, "sysl's EcPrivate is not the size of 'br_ec_private_key'")
+@assert(offsetof(EcPrivate, xlen) == EC_PRIVATE_XLEN, "EcPrivate.xlen is not where 'br_ec_private_key' has it")
+@assert(sizeof(Pkey) == PKEY_SIZE, "sysl's Pkey is not the size of 'br_x509_pkey'")
+@assert(offsetof(Pkey, rsa) == PKEY_RSA, "Pkey.rsa is not where 'br_x509_pkey' has its RSA arm")
+@assert(offsetof(PkeyEc, ec) == PKEY_EC, "PkeyEc.ec is not where 'br_x509_pkey' has its EC arm")
+@assert(sizeof(PkeyEc) <= PKEY_SIZE, "PkeyEc is larger than 'br_x509_pkey'")
+@assert(sizeof(TrustAnchor) == TA_SIZE, "sysl's TrustAnchor is not the size of 'br_x509_trust_anchor'")
+@assert(offsetof(TrustAnchor, flags) == TA_FLAGS, "TrustAnchor.flags is not where 'br_x509_trust_anchor' has it")
+@assert(offsetof(TrustAnchor, pkey) == TA_PKEY, "TrustAnchor.pkey is not where 'br_x509_trust_anchor' has it")
+@assert(sizeof(Certificate) == CERT_SIZE, "sysl's Certificate is not the size of 'br_x509_certificate'")
+@assert(offsetof(Certificate, len) == CERT_LEN, "Certificate.len is not where 'br_x509_certificate' has it")
+@assert(MAX_ALIGN <= 8, "a TLS context wants a stronger alignment than an array of u64 gives")
+@assert(GCM_ALIGN <= 8, "'br_gcm_context' wants a stronger alignment than an array of u64 gives")
+@assert(X509_MIN_ALIGN <= 8, "'br_x509_minimal_context' wants a stronger alignment than an array of u64 gives")
+@assert(SKEY_ALIGN <= 8, "'br_skey_decoder_context' wants a stronger alignment than an array of u64 gives")
+@assert(CLIENT_ENGINE == 0, "'br_ssl_client_context' no longer begins with its engine")
+@assert(SERVER_ENGINE == 0, "'br_ssl_server_context' no longer begins with its engine")
+
+// -- constants --------------------------------------------------------------------------------------
+
+c const
+    SHA1_ID:   i32 = "br_sha1_ID"
+    SHA224_ID: i32 = "br_sha224_ID"
+    SHA256_ID: i32 = "br_sha256_ID"
+    SHA384_ID: i32 = "br_sha384_ID"
+    SHA512_ID: i32 = "br_sha512_ID"
+
+c const
+    KEYTYPE_RSA: i32 = "BR_KEYTYPE_RSA"
+    KEYTYPE_EC:  i32 = "BR_KEYTYPE_EC"
+    TA_CA:       u32 = "BR_X509_TA_CA"
+
+c const
+    EC_SECP256R1: i32 = "BR_EC_secp256r1"
+    EC_SECP384R1: i32 = "BR_EC_secp384r1"
+    EC_SECP521R1: i32 = "BR_EC_secp521r1"
+
+c const
+    PEM_BEGIN_OBJ: i32 = "BR_PEM_BEGIN_OBJ"
+    PEM_END_OBJ:   i32 = "BR_PEM_END_OBJ"
+    PEM_ERROR:     i32 = "BR_PEM_ERROR"
+
+c const
+    BUFSIZE_INPUT:  usize = "BR_SSL_BUFSIZE_INPUT"
+    BUFSIZE_OUTPUT: usize = "BR_SSL_BUFSIZE_OUTPUT"
+    BUFSIZE_MONO:   usize = "BR_SSL_BUFSIZE_MONO"
+    BUFSIZE_BIDI:   usize = "BR_SSL_BUFSIZE_BIDI"
+    TLS10:          u32 = "BR_TLS10"
+    TLS12:          u32 = "BR_TLS12"
+
+c const
+    SSL_CLOSED:  u32 = "BR_SSL_CLOSED"
+    SSL_SENDREC: u32 = "BR_SSL_SENDREC"
+    SSL_RECVREC: u32 = "BR_SSL_RECVREC"
+    SSL_SENDAPP: u32 = "BR_SSL_SENDAPP"
+    SSL_RECVAPP: u32 = "BR_SSL_RECVAPP"
+
+// The error numbers a TLS engine and a certificate validator answer. A received or sent fatal alert
+// is one of the two bases plus the alert's own number.
+c const
+    ERR_OK:                 i32 = "BR_ERR_OK"
+    ERR_BAD_PARAM:          i32 = "BR_ERR_BAD_PARAM"
+    ERR_BAD_STATE:          i32 = "BR_ERR_BAD_STATE"
+    ERR_BAD_MAC:            i32 = "BR_ERR_BAD_MAC"
+    ERR_NO_RANDOM:          i32 = "BR_ERR_NO_RANDOM"
+    ERR_BAD_HANDSHAKE:      i32 = "BR_ERR_BAD_HANDSHAKE"
+    ERR_BAD_CIPHER_SUITE:   i32 = "BR_ERR_BAD_CIPHER_SUITE"
+    ERR_BAD_SIGNATURE:      i32 = "BR_ERR_BAD_SIGNATURE"
+    ERR_IO:                 i32 = "BR_ERR_IO"
+    ERR_RECV_FATAL_ALERT:   i32 = "BR_ERR_RECV_FATAL_ALERT"
+    ERR_SEND_FATAL_ALERT:   i32 = "BR_ERR_SEND_FATAL_ALERT"
+    ERR_X509_OK:            i32 = "BR_ERR_X509_OK"
+    ERR_X509_INVALID_VALUE: i32 = "BR_ERR_X509_INVALID_VALUE"
+    ERR_X509_TRUNCATED:     i32 = "BR_ERR_X509_TRUNCATED"
+    ERR_X509_EMPTY_CHAIN:   i32 = "BR_ERR_X509_EMPTY_CHAIN"
+    ERR_X509_UNSUPPORTED:   i32 = "BR_ERR_X509_UNSUPPORTED"
+    ERR_X509_BAD_SIGNATURE: i32 = "BR_ERR_X509_BAD_SIGNATURE"
+    ERR_X509_TIME_UNKNOWN:  i32 = "BR_ERR_X509_TIME_UNKNOWN"
+    ERR_X509_EXPIRED:       i32 = "BR_ERR_X509_EXPIRED"
+    ERR_X509_BAD_SERVER_NAME: i32 = "BR_ERR_X509_BAD_SERVER_NAME"
+    ERR_X509_NOT_TRUSTED:   i32 = "BR_ERR_X509_NOT_TRUSTED"
+
+// -- hashes -----------------------------------------------------------------------------------------
+
+extern "br_sha1_vtable" sha1_vtable: HashClass
+extern "br_sha224_vtable" sha224_vtable: HashClass
+extern "br_sha256_vtable" sha256_vtable: HashClass
+extern "br_sha384_vtable" sha384_vtable: HashClass
+extern "br_sha512_vtable" sha512_vtable: HashClass
+
+// `br_sha256_update` and `br_sha512_update` are macros for the 224 and 384 functions, which share
+// their compression function, so those are the symbols.
+extern "br_sha1_init" sha1_init(ctx: *HashCtx)
+extern "br_sha1_update" sha1_update(ctx: *HashCtx, data: *u8, len: usize)
+extern "br_sha1_out" sha1_out(ctx: *HashCtx, out: *u8)
+extern "br_sha224_init" sha224_init(ctx: *HashCtx)
+extern "br_sha224_update" sha224_update(ctx: *HashCtx, data: *u8, len: usize)
+extern "br_sha224_out" sha224_out(ctx: *HashCtx, out: *u8)
+extern "br_sha256_init" sha256_init(ctx: *HashCtx)
+extern "br_sha256_out" sha256_out(ctx: *HashCtx, out: *u8)
+extern "br_sha384_init" sha384_init(ctx: *HashCtx)
+extern "br_sha384_update" sha384_update(ctx: *HashCtx, data: *u8, len: usize)
+extern "br_sha384_out" sha384_out(ctx: *HashCtx, out: *u8)
+extern "br_sha512_init" sha512_init(ctx: *HashCtx)
+extern "br_sha512_out" sha512_out(ctx: *HashCtx, out: *u8)
+
+// -- HMAC and HKDF ----------------------------------------------------------------------------------
+
+extern "br_hmac_key_init" hmac_key_init(kc: *HmacKey, digest: *HashClass, key: *u8, key_len: usize)
+extern "br_hmac_init" hmac_init(ctx: *Hmac, kc: *HmacKey, out_len: usize)
+extern "br_hmac_update" hmac_update(ctx: *Hmac, data: *u8, len: usize)
+extern "br_hmac_out" hmac_out(ctx: *Hmac, out: *u8) -> usize
+
+extern "br_hkdf_init" hkdf_init(hc: *Hkdf, digest: *HashClass, salt: *u8, salt_len: usize)
+extern "br_hkdf_inject" hkdf_inject(hc: *Hkdf, ikm: *u8, ikm_len: usize)
+extern "br_hkdf_flip" hkdf_flip(hc: *Hkdf)
+extern "br_hkdf_produce" hkdf_produce(hc: *Hkdf, info: *u8, info_len: usize, out: *u8, out_len: usize) -> usize
+
+// -- a deterministic random generator (HMAC_DRBG, NIST SP 800-90A) ----------------------------------
+
+extern "br_hmac_drbg_init" hmac_drbg_init(ctx: *Drbg, digest: *HashClass, seed: *u8, seed_len: usize)
+extern "br_hmac_drbg_generate" hmac_drbg_generate(ctx: *Drbg, out: *u8, len: usize)
+extern "br_hmac_drbg_update" hmac_drbg_update(ctx: *Drbg, seed: *u8, seed_len: usize)
+
+// -- AEAD -------------------------------------------------------------------------------------------
+
+extern "br_aes_ct_ctr_vtable" aes_ct_ctr_vtable: CtrClass
+extern "br_aes_ct_ctr_init" aes_ct_ctr_init(ctx: *AesCtr, key: *u8, len: usize)
+extern "br_ghash_ctmul" ghash_ctmul(y: *u8, h: *u8, data: *u8, len: usize)
+extern "br_gcm_init" gcm_init(ctx: *Gcm, bctx: **CtrClass, gh: *extern(*u8, *u8, *u8, usize) -> unit)
+extern "br_gcm_reset" gcm_reset(ctx: *Gcm, iv: *u8, len: usize)
+extern "br_gcm_aad_inject" gcm_aad_inject(ctx: *Gcm, data: *u8, len: usize)
+extern "br_gcm_flip" gcm_flip(ctx: *Gcm)
+extern "br_gcm_run" gcm_run(ctx: *Gcm, encrypt: i32, data: *u8, len: usize)
+extern "br_gcm_get_tag" gcm_get_tag(ctx: *Gcm, tag: *u8)
+extern "br_gcm_check_tag" gcm_check_tag(ctx: *Gcm, tag: *u8) -> u32
+
+extern "br_chacha20_ct_run" chacha20_ct_run(key: *u8, iv: *u8, cc: u32, data: *u8, len: usize) -> u32
+extern "br_poly1305_ctmul_run" poly1305_ctmul_run(key: *u8, iv: *u8, data: *u8, len: usize, aad: *u8,
+                                                  aad_len: usize, tag: *u8,
+                                                  ichacha: *extern(*u8, *u8, u32, *u8, usize) -> u32,
+                                                  encrypt: i32)
+
+// -- elliptic curves and ECDSA ----------------------------------------------------------------------
+
+extern "br_ec_all_m31" ec_all_m31: EcImpl
+extern "br_ec_keygen" ec_keygen(rng: **u8, curves: *EcImpl, sk: *EcPrivate, kbuf: *u8, curve: i32) -> usize
+extern "br_ec_compute_pub" ec_compute_pub(curves: *EcImpl, pk: *EcPublic, kbuf: *u8, sk: *EcPrivate) -> usize
+extern "br_ecdsa_i31_sign_raw" ecdsa_sign_raw(curves: *EcImpl, hf: *HashClass, hash: *u8, sk: *EcPrivate, sig: *u8) -> usize
+extern "br_ecdsa_i31_vrfy_raw" ecdsa_vrfy_raw(curves: *EcImpl, hash: *u8, hash_len: usize, pk: *EcPublic, sig: *u8, sig_len: usize) -> u32
+extern "br_ecdsa_i31_vrfy_asn1" ecdsa_vrfy_asn1(curves: *EcImpl, hash: *u8, hash_len: usize, pk: *EcPublic, sig: *u8, sig_len: usize) -> u32
+extern "br_ecdsa_raw_to_asn1" ecdsa_raw_to_asn1(sig: *u8, sig_len: usize) -> usize
+
+// -- RSA --------------------------------------------------------------------------------------------
+
+extern "br_rsa_i31_pkcs1_sign" rsa_pkcs1_sign(hash_oid: *u8, hash: *u8, hash_len: usize, sk: *RsaPrivate, x: *u8) -> u32
+extern "br_rsa_i31_pkcs1_vrfy" rsa_pkcs1_vrfy(x: *u8, xlen: usize, hash_oid: *u8, hash_len: usize, pk: *RsaPublic, hash_out: *u8) -> u32
+extern "br_rsa_i31_compute_modulus" rsa_compute_modulus(n: *u8, sk: *RsaPrivate) -> usize
+extern "br_rsa_i31_compute_pubexp" rsa_compute_pubexp(sk: *RsaPrivate) -> u32
+
+// -- PEM, certificates and private keys -------------------------------------------------------------
+
+extern "br_pem_decoder_init" pem_decoder_init(ctx: *PemDecoder)
+extern "br_pem_decoder_push" pem_decoder_push(ctx: *PemDecoder, data: *u8, len: usize) -> usize
+extern "br_pem_decoder_event" pem_decoder_event(ctx: *PemDecoder) -> i32
+extern "sysl_br_pem_decoder_setdest" pem_decoder_setdest(ctx: *PemDecoder, dest: *extern(*u8, *u8, usize) -> unit, dest_ctx: *u8)
+extern "sysl_br_pem_decoder_name" pem_decoder_name(ctx: *PemDecoder) -> *u8
+
+extern "br_x509_decoder_init" x509_decoder_init(ctx: *X509Decoder, append_dn: *extern(*u8, *u8, usize) -> unit,append_dn_ctx: *u8)
+extern "br_x509_decoder_push" x509_decoder_push(ctx: *X509Decoder, data: *u8, len: usize)
+extern "sysl_br_x509_decoder_get_pkey" x509_decoder_get_pkey(ctx: *X509Decoder) -> *Pkey
+extern "sysl_br_x509_decoder_last_error" x509_decoder_last_error(ctx: *X509Decoder) -> i32
+extern "sysl_br_x509_decoder_is_ca" x509_decoder_is_ca(ctx: *X509Decoder) -> i32
+extern "sysl_br_x509_decoder_signer_key_type" x509_decoder_signer_key_type(ctx: *X509Decoder) -> i32
+
+extern "br_skey_decoder_init" skey_decoder_init(ctx: *SkeyDecoder)
+extern "br_skey_decoder_push" skey_decoder_push(ctx: *SkeyDecoder, data: *u8, len: usize)
+extern "sysl_br_skey_decoder_last_error" skey_decoder_last_error(ctx: *SkeyDecoder) -> i32
+extern "sysl_br_skey_decoder_key_type" skey_decoder_key_type(ctx: *SkeyDecoder) -> i32
+extern "sysl_br_skey_decoder_get_rsa" skey_decoder_get_rsa(ctx: *SkeyDecoder) -> *RsaPrivate
+extern "sysl_br_skey_decoder_get_ec" skey_decoder_get_ec(ctx: *SkeyDecoder) -> *EcPrivate
+
+extern "sysl_br_x509_minimal_set_time" x509_minimal_set_time(ctx: *X509Minimal, days: u32, seconds: u32)
+
+// -- the TLS engine ---------------------------------------------------------------------------------
+
+extern "br_ssl_client_init_full" ssl_client_init_full(cc: *ClientCtx, xc: *X509Minimal, anchors: *TrustAnchor, count: usize)
+extern "br_ssl_client_reset" ssl_client_reset(cc: *ClientCtx, server_name: *u8, resume: i32) -> i32
+extern "br_ssl_server_init_full_rsa" ssl_server_init_full_rsa(cc: *ServerCtx, chain: *Certificate, chain_len: usize, sk: *RsaPrivate)
+extern "br_ssl_server_init_full_ec" ssl_server_init_full_ec(cc: *ServerCtx, chain: *Certificate, chain_len: usize,
+                                                            issuer_key_type: u32, sk: *EcPrivate)
+extern "br_ssl_server_reset" ssl_server_reset(cc: *ServerCtx) -> i32
+
+extern "br_ssl_engine_set_buffer" engine_set_buffer(cc: *Engine, buf: *u8, len: usize, bidi: i32)
+extern "br_ssl_engine_set_suites" engine_set_suites(cc: *Engine, suites: *u16, count: usize)
+extern "br_ssl_engine_inject_entropy" engine_inject_entropy(cc: *Engine, data: *u8, len: usize)
+extern "br_ssl_engine_current_state" engine_current_state(cc: *Engine) -> u32
+extern "br_ssl_engine_sendapp_buf" engine_sendapp_buf(cc: *Engine, len: *usize) -> *u8
+extern "br_ssl_engine_sendapp_ack" engine_sendapp_ack(cc: *Engine, len: usize)
+extern "br_ssl_engine_recvapp_buf" engine_recvapp_buf(cc: *Engine, len: *usize) -> *u8
+extern "br_ssl_engine_recvapp_ack" engine_recvapp_ack(cc: *Engine, len: usize)
+extern "br_ssl_engine_sendrec_buf" engine_sendrec_buf(cc: *Engine, len: *usize) -> *u8
+extern "br_ssl_engine_sendrec_ack" engine_sendrec_ack(cc: *Engine, len: usize)
+extern "br_ssl_engine_recvrec_buf" engine_recvrec_buf(cc: *Engine, len: *usize) -> *u8
+extern "br_ssl_engine_recvrec_ack" engine_recvrec_ack(cc: *Engine, len: usize)
+extern "br_ssl_engine_flush" engine_flush(cc: *Engine, force: i32)
+extern "br_ssl_engine_close" engine_close(cc: *Engine)
+extern "sysl_br_engine_last_error" engine_last_error(cc: *Engine) -> i32
+extern "sysl_br_engine_set_versions" engine_set_versions(cc: *Engine, lo: u32, hi: u32)
+extern "sysl_br_engine_version" engine_version(cc: *Engine) -> u32
+extern "sysl_br_engine_cipher_suite" engine_cipher_suite(cc: *Engine) -> u32

@@ -1,0 +1,208 @@
+// Hashes, HMAC, HKDF and a deterministic random generator.
+//
+// Every context here is plain data with no pointer into itself, so a `Digest` or a `Mac` may be
+// copied freely: a copy is a fork of the computation, which is how a running hash of a transcript is
+// read without ending it.
+
+module sh.sysl.bearssl
+
+import sh.sysl.bearssl.c
+import sysl.slices.{as_mut_ptr, as_ptr}
+
+private[bearssl] const HASH_WORDS: usize = (c.HASH_SIZE + 7) / 8
+private[bearssl] const HMAC_KEY_WORDS: usize = (c.HMAC_KEY_SIZE + 7) / 8
+private[bearssl] const HMAC_WORDS: usize = (c.HMAC_SIZE + 7) / 8
+private[bearssl] const HKDF_WORDS: usize = (c.HKDF_SIZE + 7) / 8
+private[bearssl] const DRBG_WORDS: usize = (c.DRBG_SIZE + 7) / 8
+
+// The longest output of any hash here, SHA-512's.
+const MAX_HASH_SIZE: usize = 64
+
+// The hash functions BearSSL carries, less MD5 (which is only there for TLS 1.0's PRF).
+enum Hash
+    Sha1
+    Sha224
+    Sha256
+    Sha384
+    Sha512
+
+    // The length of its output, in bytes.
+    size(self) -> usize = self match
+        Sha1 -> 20
+        Sha224 -> 28
+        Sha256 -> 32
+        Sha384 -> 48
+        Sha512 -> 64
+
+    // BearSSL's number for it, which is TLS's.
+    id(self) -> i32 = self match
+        Sha1 -> c.SHA1_ID
+        Sha224 -> c.SHA224_ID
+        Sha256 -> c.SHA256_ID
+        Sha384 -> c.SHA384_ID
+        Sha512 -> c.SHA512_ID
+
+    private[bearssl] vtable(self) -> *c.HashClass = self match
+        Sha1 -> &c.sha1_vtable
+        Sha224 -> &c.sha224_vtable
+        Sha256 -> &c.sha256_vtable
+        Sha384 -> &c.sha384_vtable
+        Sha512 -> &c.sha512_vtable
+
+    // The DER `DigestInfo` prefix PKCS#1 v1.5 puts in front of a hash, in BearSSL's form: a length
+    // byte, then the object identifier's bytes.
+    private[bearssl] oid(self) -> []const u8 = self match
+        Sha1 -> OID_SHA1[..]
+        Sha224 -> OID_SHA224[..]
+        Sha256 -> OID_SHA256[..]
+        Sha384 -> OID_SHA384[..]
+        Sha512 -> OID_SHA512[..]
+end Hash
+
+private val OID_SHA1: [6]u8 = [0x05, 0x2B, 0x0E, 0x03, 0x02, 0x1A]
+private val OID_SHA224: [10]u8 = [0x09, 0x60, 0x86, 0x48, 0x01, 0x65, 0x03, 0x04, 0x02, 0x04]
+private val OID_SHA256: [10]u8 = [0x09, 0x60, 0x86, 0x48, 0x01, 0x65, 0x03, 0x04, 0x02, 0x01]
+private val OID_SHA384: [10]u8 = [0x09, 0x60, 0x86, 0x48, 0x01, 0x65, 0x03, 0x04, 0x02, 0x02]
+private val OID_SHA512: [10]u8 = [0x09, 0x60, 0x86, 0x48, 0x01, 0x65, 0x03, 0x04, 0x02, 0x03]
+
+// A hash being computed.
+struct Digest
+    private state: [HASH_WORDS]u64
+    hash: Hash
+
+    // Add bytes to what is hashed.
+    update(*self, bytes: []const u8)
+        val ctx = self.ctx()
+        val p = as_ptr(bytes)
+
+        // SHA-256 and SHA-512 update through the SHA-224 and SHA-384 functions, which share their
+        // compression functions; BearSSL's own names for them are macros.
+        self.hash match
+            Sha1 -> c.sha1_update(ctx, p, bytes.len)
+            Sha224 -> c.sha224_update(ctx, p, bytes.len)
+            Sha256 -> c.sha224_update(ctx, p, bytes.len)
+            Sha384 -> c.sha384_update(ctx, p, bytes.len)
+            Sha512 -> c.sha384_update(ctx, p, bytes.len)
+    end update
+
+    // Write the hash of everything so far into `out` and answer its length. The digest is not
+    // ended: more may be added, and a later `finish` covers it all.
+    finish(*self, out: []u8) -> Result[usize, Error]
+        val n = self.hash.size()
+
+        if out.len < n then return fail(TOO_SMALL)
+
+        val ctx = self.ctx()
+        val p = as_mut_ptr(out)
+
+        self.hash match
+            Sha1 -> c.sha1_out(ctx, p)
+            Sha224 -> c.sha224_out(ctx, p)
+            Sha256 -> c.sha256_out(ctx, p)
+            Sha384 -> c.sha384_out(ctx, p)
+            Sha512 -> c.sha512_out(ctx, p)
+
+        Ok(n)
+    end finish
+
+    private ctx(*self) -> *c.HashCtx = ptr_cast(&self.state[0])
+end Digest
+
+// A fresh digest of `hash`.
+digest(hash: Hash) -> Digest
+    var d = Digest([0; HASH_WORDS], hash)
+    val ctx = d.ctx()
+
+    hash match
+        Sha1 -> c.sha1_init(ctx)
+        Sha224 -> c.sha224_init(ctx)
+        Sha256 -> c.sha256_init(ctx)
+        Sha384 -> c.sha384_init(ctx)
+        Sha512 -> c.sha512_init(ctx)
+
+    d
+end digest
+
+// The hash of `bytes`, written into `out`; answers its length.
+hash_of(hash: Hash, bytes: []const u8, out: []u8) -> Result[usize, Error]
+    var d = digest(hash)
+
+    d.update(bytes)
+    d.finish(out)
+
+// An HMAC being computed (RFC 2104).
+struct Mac
+    private state: [HMAC_WORDS]u64
+    hash: Hash
+
+    update(*self, bytes: []const u8) = c.hmac_update(self.ctx(), as_ptr(bytes), bytes.len)
+
+    // Write the MAC of everything so far into `out` and answer its length, which is the hash's.
+    finish(*self, out: []u8) -> Result[usize, Error]
+        if out.len < self.hash.size() then return fail(TOO_SMALL)
+
+        Ok(c.hmac_out(self.ctx(), as_mut_ptr(out)))
+
+    private ctx(*self) -> *c.Hmac = ptr_cast(&self.state[0])
+end Mac
+
+// A fresh HMAC of `hash` under `key`. The key is not kept: BearSSL folds it into the inner and outer
+// states at once.
+mac(hash: Hash, key: []const u8) -> Mac
+    var kc: [HMAC_KEY_WORDS]u64 = [0; HMAC_KEY_WORDS]
+    var m = Mac([0; HMAC_WORDS], hash)
+
+    c.hmac_key_init(ptr_cast(&kc[0]), hash.vtable(), as_ptr(key), key.len)
+    c.hmac_init(m.ctx(), ptr_cast(&kc[0]), 0)
+    m
+end mac
+
+// The HMAC of `data` under `key`, written into `out`; answers its length.
+hmac(hash: Hash, key: []const u8, data: []const u8, out: []u8) -> Result[usize, Error]
+    var m = mac(hash, key)
+
+    m.update(data)
+    m.finish(out)
+
+// HKDF (RFC 5869): extract a key from `ikm` under `salt`, then expand it with `info` to fill `out`.
+//
+// An empty `salt` is the RFC's "not provided", a string of zeros the hash's length, which HMAC reads
+// the same way. `out` may be at most 255 times the hash's length.
+hkdf(hash: Hash, salt: []const u8, ikm: []const u8, info: []const u8, out: []u8) -> Result[unit, Error]
+    if out.len > 255 * hash.size() then return fail(BAD_LENGTH)
+
+    var hc: [HKDF_WORDS]u64 = [0; HKDF_WORDS]
+    val ctx: *c.Hkdf = ptr_cast(&hc[0])
+
+    c.hkdf_init(ctx, hash.vtable(), as_ptr(salt), salt.len)
+    c.hkdf_inject(ctx, as_ptr(ikm), ikm.len)
+    c.hkdf_flip(ctx)
+    c.hkdf_produce(ctx, as_ptr(info), info.len, as_mut_ptr(out), out.len)
+    Ok(())
+end hkdf
+
+// A deterministic random bit generator: HMAC_DRBG over SHA-256 (NIST SP 800-90A).
+//
+// **It is exactly as unpredictable as its seed.** It makes no randomness; it stretches what it was
+// given. On a board the seed comes from a hardware generator (the RP2350's TRNG, an STM32's RNG).
+struct Random
+    private state: [DRBG_WORDS]u64
+
+    // Fill `out` with bytes.
+    fill(*self, out: []u8) = c.hmac_drbg_generate(self.ctx(), as_mut_ptr(out), out.len)
+
+    // Mix more entropy in.
+    reseed(*self, entropy: []const u8) = c.hmac_drbg_update(self.ctx(), as_ptr(entropy), entropy.len)
+
+    private[bearssl] ctx(*self) -> *c.Drbg = ptr_cast(&self.state[0])
+end Random
+
+// A generator seeded with `seed`, which must be at least 32 bytes of real entropy.
+random(seed: []const u8) -> Result[Random, Error]
+    if seed.len < 32 then return fail(SEED_TOO_SHORT)
+
+    var r = Random([0; DRBG_WORDS])
+
+    c.hmac_drbg_init(r.ctx(), &c.sha256_vtable, as_ptr(seed), seed.len)
+    Ok(r)
+end random

@@ -1,0 +1,372 @@
+// Keys, and signatures with them: ECDSA over P-256, P-384 and P-521, and RSA PKCS#1 v1.5.
+//
+// **A key here is bytes inside a sysl value**, not a pointer into something else's storage: BearSSL's
+// key structures are pointers and lengths, and the binding builds one over the value's own bytes for
+// the length of each call. So a key may be copied, returned and kept like any other value.
+//
+// **ECDSA signing is deterministic** (RFC 6979: BearSSL derives the nonce from the key and the hash),
+// so it needs no random generator and the RFC's own vectors are an exact oracle.
+
+module sh.sysl.bearssl
+
+import sh.sysl.bearssl.c
+import sysl.slices.{as_mut_ptr, as_ptr, copy}
+
+// The longest scalar and point of any curve here, P-521's.
+const MAX_EC_SCALAR: usize = 66
+const MAX_EC_POINT: usize = 133
+
+// The largest RSA modulus a key here holds, in bytes: 4096 bits.
+const MAX_RSA_BYTES: usize = 512
+
+// The NIST prime curves BearSSL implements for ECDSA and ECDHE.
+enum Curve
+    P256
+    P384
+    P521
+
+    // BearSSL's number for it, which is TLS's.
+    id(self) -> i32 = self match
+        P256 -> c.EC_SECP256R1
+        P384 -> c.EC_SECP384R1
+        P521 -> c.EC_SECP521R1
+
+    // The length of a private scalar, in bytes.
+    scalar_size(self) -> usize = self match
+        P256 -> 32
+        P384 -> 48
+        P521 -> 66
+
+    // The length of an uncompressed public point (`04 || X || Y`), in bytes.
+    point_size(self) -> usize = 2 * self.scalar_size() + 1
+end Curve
+
+private[bearssl] curve_of(id: i32) -> Option[Curve]
+    if id == c.EC_SECP256R1 then return Some(Curve.P256)
+    if id == c.EC_SECP384R1 then return Some(Curve.P384)
+    if id == c.EC_SECP521R1 then return Some(Curve.P521)
+
+    None
+end curve_of
+
+// An EC private key: a curve and a scalar.
+struct EcPrivateKey
+    curve: Curve
+    private x: [MAX_EC_SCALAR]u8
+    private len: usize
+
+    // The scalar, big-endian.
+    scalar(*self) -> []const u8 = self.x[0..<self.len]
+
+    // The public point that goes with it.
+    public_key(*self) -> EcPublicKey
+        var pk = EcPublicKey(self.curve, [0; MAX_EC_POINT], 0)
+        var raw = c.EcPublic(0, null, 0)
+        var sk = self.raw()
+
+        pk.len = c.ec_compute_pub(&c.ec_all_m31, &raw, &pk.q[0], &sk)
+        pk
+    end public_key
+
+    // Sign `hash_value`, the output of `hash` over the message, and write the signature into `sig` in
+    // the raw form (`r || s`, each the curve's scalar size). Answers its length.
+    sign(*self, hash: Hash, hash_value: []const u8, sig: []u8) -> Result[usize, Error]
+        if hash_value.len != hash.size() then return fail(BAD_LENGTH)
+        if sig.len < 2 * self.curve.scalar_size() then return fail(TOO_SMALL)
+
+        var sk = self.raw()
+        val n = c.ecdsa_sign_raw(&c.ec_all_m31, hash.vtable(), as_ptr(hash_value), &sk, as_mut_ptr(sig))
+
+        if n == 0 then fail(BAD_KEY) else Ok(n)
+    end sign
+
+    // The same signature in the DER form X.509 and TLS carry (`SEQUENCE { r, s }`). `sig` needs room
+    // for up to `2 * scalar_size + 9` bytes.
+    sign_der(*self, hash: Hash, hash_value: []const u8, sig: []u8) -> Result[usize, Error]
+        if sig.len < 2 * self.curve.scalar_size() + 9 then return fail(TOO_SMALL)
+
+        val n = self.sign(hash, hash_value, sig)?
+
+        Ok(c.ecdsa_raw_to_asn1(as_mut_ptr(sig), n))
+    end sign_der
+
+    private[bearssl] raw(*self) -> c.EcPrivate = c.EcPrivate(self.curve.id(), &self.x[0], self.len)
+end EcPrivateKey
+
+// An EC private key from its scalar, big-endian and exactly the curve's scalar size.
+ec_private_key(curve: Curve, scalar: []const u8) -> Result[EcPrivateKey, Error]
+    if scalar.len != curve.scalar_size() then return fail(BAD_LENGTH)
+
+    var k = EcPrivateKey(curve, [0; MAX_EC_SCALAR], scalar.len)
+
+    copy(k.x[..], scalar)
+    Ok(k)
+end ec_private_key
+
+// A fresh EC private key, drawn from `rng`.
+generate_ec_key(rng: *Random, curve: Curve) -> Result[EcPrivateKey, Error]
+    var k = EcPrivateKey(curve, [0; MAX_EC_SCALAR], 0)
+    var raw = c.EcPrivate(0, null, 0)
+
+    // A `br_hmac_drbg_context` begins with its vtable pointer, which is what BearSSL means by a
+    // `const br_prng_class **`.
+    k.len = c.ec_keygen(ptr_cast(rng.ctx()), &c.ec_all_m31, &raw, &k.x[0], curve.id())
+
+    if k.len == 0 then fail(BAD_KEY) else Ok(k)
+end generate_ec_key
+
+// An EC public key: a curve and an uncompressed point.
+struct EcPublicKey
+    curve: Curve
+    private q: [MAX_EC_POINT]u8
+    private len: usize
+
+    // The point, `04 || X || Y`.
+    point(*self) -> []const u8 = self.q[0..<self.len]
+
+    // Whether `sig`, in the raw form, is a signature by this key over `hash_value`.
+    verify(*self, hash_value: []const u8, sig: []const u8) -> bool
+        var pk = self.raw()
+
+        c.ecdsa_vrfy_raw(&c.ec_all_m31, as_ptr(hash_value), hash_value.len, &pk, as_ptr(sig), sig.len) == 1
+
+    // Whether `sig`, in the DER form, is a signature by this key over `hash_value`.
+    verify_der(*self, hash_value: []const u8, sig: []const u8) -> bool
+        var pk = self.raw()
+
+        c.ecdsa_vrfy_asn1(&c.ec_all_m31, as_ptr(hash_value), hash_value.len, &pk, as_ptr(sig), sig.len) == 1
+
+    private raw(*self) -> c.EcPublic = c.EcPublic(self.curve.id(), &self.q[0], self.len)
+end EcPublicKey
+
+// An EC public key from its uncompressed point, which must be the curve's point size.
+ec_public_key(curve: Curve, point: []const u8) -> Result[EcPublicKey, Error]
+    if point.len != curve.point_size() || point[0] != 4 then return fail(BAD_LENGTH)
+
+    var k = EcPublicKey(curve, [0; MAX_EC_POINT], point.len)
+
+    copy(k.q[..], point)
+    Ok(k)
+end ec_public_key
+
+// An RSA public key: a modulus and an exponent, each big-endian.
+struct RsaPublicKey
+    private n: [MAX_RSA_BYTES]u8
+    private nlen: usize
+    private e: [8]u8
+    private elen: usize
+
+    modulus(*self) -> []const u8 = self.n[0..<self.nlen]
+
+    exponent(*self) -> []const u8 = self.e[0..<self.elen]
+
+    // Whether `sig` is a PKCS#1 v1.5 signature by this key over `hash_value`, the output of `hash`.
+    verify(*self, hash: Hash, hash_value: []const u8, sig: []const u8) -> bool
+        if hash_value.len != hash.size() || sig.len != self.nlen then return false
+
+        var pk = self.raw()
+        var recovered: [MAX_HASH_SIZE]u8 = [0; MAX_HASH_SIZE]
+
+        if c.rsa_pkcs1_vrfy(as_ptr(sig), sig.len, as_ptr(hash.oid()), hash_value.len, &pk, &recovered[0]) != 1
+            return false
+
+        same(recovered[0..<hash_value.len], hash_value)
+    end verify
+
+    private raw(*self) -> c.RsaPublic = c.RsaPublic(&self.n[0], self.nlen, &self.e[0], self.elen)
+end RsaPublicKey
+
+// An RSA public key from its modulus and exponent. Leading zero bytes are dropped.
+rsa_public_key(modulus: []const u8, exponent: []const u8) -> Result[RsaPublicKey, Error]
+    val n = trimmed(modulus)
+    val e = trimmed(exponent)
+
+    if n.len == 0 || n.len > MAX_RSA_BYTES || e.len == 0 || e.len > 8 then return fail(BAD_LENGTH)
+
+    var k = RsaPublicKey([0; MAX_RSA_BYTES], n.len, [0; 8], e.len)
+
+    copy(k.n[..], n)
+    copy(k.e[..], e)
+    Ok(k)
+end rsa_public_key
+
+private trimmed(b: []const u8) -> []const u8
+    var i = 0usize
+
+    while i < b.len && b[i] == 0
+        i += 1
+
+    b[i..]
+end trimmed
+
+// An RSA private key in the CRT form BearSSL signs with: the two primes, the two reduced exponents
+// and the inverse of `q`.
+struct RsaPrivateKey
+    private n_bitlen: u32
+    private p: [MAX_RSA_BYTES / 2]u8
+    private plen: usize
+    private q: [MAX_RSA_BYTES / 2]u8
+    private qlen: usize
+    private dp: [MAX_RSA_BYTES / 2]u8
+    private dplen: usize
+    private dq: [MAX_RSA_BYTES / 2]u8
+    private dqlen: usize
+    private iq: [MAX_RSA_BYTES / 2]u8
+    private iqlen: usize
+
+    // The modulus's length in bytes, which is a signature's.
+    size(self) -> usize = usize((self.n_bitlen + 7) / 8)
+
+    // Sign `hash_value`, the output of `hash` over the message, with PKCS#1 v1.5, and write the
+    // signature into `sig`. Answers its length, the modulus's.
+    sign(*self, hash: Hash, hash_value: []const u8, sig: []u8) -> Result[usize, Error]
+        if hash_value.len != hash.size() then return fail(BAD_LENGTH)
+
+        val n = self.size()
+
+        if sig.len < n then return fail(TOO_SMALL)
+
+        var sk = self.raw()
+
+        if c.rsa_pkcs1_sign(as_ptr(hash.oid()), as_ptr(hash_value), hash_value.len, &sk, as_mut_ptr(sig)) != 1
+            return fail(BAD_KEY)
+
+        Ok(n)
+    end sign
+
+    // The public key that goes with it.
+    public_key(*self) -> Result[RsaPublicKey, Error]
+        var sk = self.raw()
+        var k = RsaPublicKey([0; MAX_RSA_BYTES], 0, [0; 8], 4)
+
+        k.nlen = c.rsa_compute_modulus(&k.n[0], &sk)
+
+        val e = c.rsa_compute_pubexp(&sk)
+
+        if k.nlen == 0 || e == 0 then return fail(BAD_KEY)
+
+        k.e[0] = u8(e >> 24)
+        k.e[1] = u8((e >> 16) & 0xff)
+        k.e[2] = u8((e >> 8) & 0xff)
+        k.e[3] = u8(e & 0xff)
+
+        val t = trimmed(k.e[0..<4])
+        var e2: [8]u8 = [0; 8]
+
+        copy(e2[..], t)
+        k.e = e2
+        k.elen = t.len
+        Ok(k)
+    end public_key
+
+    private[bearssl] raw(*self) -> c.RsaPrivate =
+        c.RsaPrivate(self.n_bitlen, &self.p[0], self.plen, &self.q[0], self.qlen, &self.dp[0], self.dplen,
+                     &self.dq[0], self.dqlen, &self.iq[0], self.iqlen)
+end RsaPrivateKey
+
+// A private key of either kind, as a PEM or DER file holds one.
+enum PrivateKey
+    Ec(key: EcPrivateKey)
+    Rsa(key: RsaPrivateKey)
+
+// A public key of either kind, as a certificate carries one.
+enum PublicKey
+    Ec(key: EcPublicKey)
+    Rsa(key: RsaPublicKey)
+
+private const SKEY_WORDS: usize = (c.SKEY_SIZE + 7) / 8
+
+// A private key from its DER encoding: PKCS#8 (`PRIVATE KEY`), or the raw RSA (`RSA PRIVATE KEY`, PKCS#1)
+// or EC (`EC PRIVATE KEY`, RFC 5915) forms.
+private_key(der: []const u8) -> Result[PrivateKey, Error]
+    var dec: [SKEY_WORDS]u64 = [0; SKEY_WORDS]
+    val ctx: *c.SkeyDecoder = ptr_cast(&dec[0])
+
+    c.skey_decoder_init(ctx)
+    c.skey_decoder_push(ctx, as_ptr(der), der.len)
+    key_of(ctx)
+end private_key
+
+// A private key from PEM text: the first private key object in it, of any of the three kinds.
+private_key_pem(text: []const u8) -> Result[PrivateKey, Error]
+    var dec: [SKEY_WORDS]u64 = [0; SKEY_WORDS]
+    val ctx: *c.SkeyDecoder = ptr_cast(&dec[0])
+    var pem = pem_reader(text)
+
+    loop
+        pem.next()? match
+            None -> return fail(BAD_KEY)
+            Some(kind) ->
+                if kind.is_key()
+                    c.skey_decoder_init(ctx)
+                    pem.feed(&feed_skey, ptr_cast(ctx))?
+                    return key_of(ctx)
+
+                pem.skip()?
+end private_key_pem
+
+private[bearssl] feed_skey(ctx: *u8, src: *u8, len: usize) = c.skey_decoder_push(ptr_cast(ctx), src, len)
+
+// The key a finished decoder holds, copied out of it.
+private[bearssl] key_of(ctx: *c.SkeyDecoder) -> Result[PrivateKey, Error]
+    if c.skey_decoder_last_error(ctx) != 0 then return fail(BAD_KEY)
+
+    val kind = c.skey_decoder_key_type(ctx)
+
+    if kind == c.KEYTYPE_EC
+        val ec = c.skey_decoder_get_ec(ctx)
+        val curve = curve_of(ec.curve).ok_or(Error(BAD_KEY))?
+
+        return Ok(PrivateKey.Ec(ec_private_key(curve, ec.x[0..<ec.xlen])?))
+
+    if kind == c.KEYTYPE_RSA
+        val r = c.skey_decoder_get_rsa(ctx)
+
+        if r.plen > MAX_RSA_BYTES / 2 || r.qlen > MAX_RSA_BYTES / 2 || r.dplen > MAX_RSA_BYTES / 2 ||
+           r.dqlen > MAX_RSA_BYTES / 2 || r.iqlen > MAX_RSA_BYTES / 2
+            return fail(BAD_LENGTH)
+
+        var k = RsaPrivateKey(r.n_bitlen, [0; MAX_RSA_BYTES / 2], r.plen, [0; MAX_RSA_BYTES / 2], r.qlen,
+                              [0; MAX_RSA_BYTES / 2], r.dplen, [0; MAX_RSA_BYTES / 2], r.dqlen,
+                              [0; MAX_RSA_BYTES / 2], r.iqlen)
+
+        copy(k.p[..], r.p[0..<r.plen])
+        copy(k.q[..], r.q[0..<r.qlen])
+        copy(k.dp[..], r.dp[0..<r.dplen])
+        copy(k.dq[..], r.dq[0..<r.dqlen])
+        copy(k.iq[..], r.iq[0..<r.iqlen])
+        return Ok(PrivateKey.Rsa(k))
+
+    fail(BAD_KEY)
+end key_of
+
+// The public key in an X.509 certificate, from its DER encoding. Nothing about the certificate is
+// checked but that it decodes: this is for reading a key, not for trusting one.
+certificate_public_key(der: []const u8) -> Result[PublicKey, Error]
+    var dec: [X509_DEC_WORDS]u64 = [0; X509_DEC_WORDS]
+    val ctx: *c.X509Decoder = ptr_cast(&dec[0])
+
+    c.x509_decoder_init(ctx, &discard, null)
+    c.x509_decoder_push(ctx, as_ptr(der), der.len)
+
+    public_of(ctx)
+end certificate_public_key
+
+private[bearssl] public_of(ctx: *c.X509Decoder) -> Result[PublicKey, Error]
+    if c.x509_decoder_last_error(ctx) != 0 then return fail(BAD_CERTIFICATE)
+
+    val pk = c.x509_decoder_get_pkey(ctx)
+
+    if pk == null then return fail(BAD_CERTIFICATE)
+
+    if i32(pk.key_type) == c.KEYTYPE_EC
+        val ek: *c.PkeyEc = ptr_cast(pk)
+        val curve = curve_of(ek.ec.curve).ok_or(Error(BAD_CERTIFICATE))?
+
+        return Ok(PublicKey.Ec(ec_public_key(curve, ek.ec.q[0..<ek.ec.qlen])?))
+
+    Ok(PublicKey.Rsa(rsa_public_key(pk.rsa.n[0..<pk.rsa.nlen], pk.rsa.e[0..<pk.rsa.elen])?))
+end public_of
+
+// A callback that takes bytes and keeps none of them.
+private[bearssl] discard(ctx: *u8, src: *u8, len: usize) = ()

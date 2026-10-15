@@ -1,0 +1,149 @@
+// PEM: the base64 armour certificates and keys travel in.
+//
+// A `PemReader` walks the objects in a text one at a time: `next` finds the start of one and says what
+// kind it is, then `read` decodes it into a buffer or `skip` passes over it. Nothing is allocated, and
+// an object is decoded as it streams past, so a certificate is never held twice.
+
+module sh.sysl.bearssl
+
+import sh.sysl.bearssl.c
+import sysl.slices.{as_mut_ptr, as_ptr}
+
+private const PEM_WORDS: usize = (c.PEM_SIZE + 7) / 8
+
+// What a PEM object's label says it is.
+enum PemKind
+    // `CERTIFICATE` or `X509 CERTIFICATE`.
+    Certificate
+
+    // `PRIVATE KEY`: PKCS#8, of either kind.
+    PrivateKey
+
+    // `EC PRIVATE KEY`: RFC 5915.
+    EcPrivateKey
+
+    // `RSA PRIVATE KEY`: PKCS#1.
+    RsaPrivateKey
+
+    // Anything else (`PUBLIC KEY`, `EC PARAMETERS`, ...).
+    Other
+
+    is_key(self) -> bool = self match
+        PrivateKey -> true
+        EcPrivateKey -> true
+        RsaPrivateKey -> true
+        _ -> false
+end PemKind
+
+// A walk over the PEM objects in a text.
+//
+// **It must stay where it is once `next` has been called**: BearSSL's decoder keeps pointers into its
+// own stacks, which live inside this value.
+struct PemReader
+    private dec: [PEM_WORDS]u64
+    private text: []const u8
+    private at: usize
+    private started: bool
+    private finished: bool
+
+    // Move to the start of the next object and say what kind it is; `None` when the text has no more.
+    next(*self) -> Result[Option[PemKind], Error]
+        if !self.started
+            c.pem_decoder_init(self.ctx())
+            self.started = true
+
+        c.pem_decoder_setdest(self.ctx(), &discard, null)
+
+        loop
+            val ev = self.pump()
+
+            if ev == 0 then return Ok(None)
+            if ev == c.PEM_ERROR then return fail(BAD_PEM)
+            if ev == c.PEM_BEGIN_OBJ then return Ok(Some(kind_of(c.pem_decoder_name(self.ctx()))))
+    end next
+
+    // Decode the object `next` found into `out`, and answer its length.
+    read(*self, out: []u8) -> Result[usize, Error]
+        var sink = Sink(as_mut_ptr(out), out.len, 0, false)
+
+        self.feed(&sink_append, ptr_cast(&sink))?
+
+        if sink.over then fail(TOO_SMALL) else Ok(sink.len)
+    end read
+
+    // Pass over the object `next` found.
+    skip(*self) -> Result[unit, Error] = self.feed(&discard, null)
+
+    // Decode the object `next` found through a callback, which BearSSL calls with each piece.
+    private[bearssl] feed(*self, dest: *extern(*u8, *u8, usize) -> unit, ctx: *u8) -> Result[unit, Error]
+        c.pem_decoder_setdest(self.ctx(), dest, ctx)
+
+        loop
+            val ev = self.pump()
+
+            if ev == c.PEM_END_OBJ then return Ok(())
+            if ev == 0 || ev == c.PEM_ERROR || ev == c.PEM_BEGIN_OBJ then return fail(BAD_PEM)
+    end feed
+
+    // Push text until the decoder has something to say; 0 when the text is exhausted. A final newline
+    // is pushed after the text, since BearSSL only ends an object at the end of its `-----END` line.
+    private pump(*self) -> i32
+        loop
+            if self.at < self.text.len
+                val rest = self.text[self.at..]
+
+                self.at += c.pem_decoder_push(self.ctx(), as_ptr(rest), rest.len)
+            else if !self.finished
+                self.finished = true
+                c.pem_decoder_push(self.ctx(), as_ptr("\n".bytes), 1)
+            else
+                return c.pem_decoder_event(self.ctx())
+
+            val ev = c.pem_decoder_event(self.ctx())
+
+            if ev != 0 then return ev
+    end pump
+
+    private ctx(*self) -> *c.PemDecoder = ptr_cast(&self.dec[0])
+end PemReader
+
+// A walk over the PEM objects in `text`.
+pem_reader(text: []const u8) -> PemReader = PemReader([0; PEM_WORDS], text, 0, false, false)
+
+private kind_of(name: *u8) -> PemKind
+    if named(name, "CERTIFICATE") || named(name, "X509 CERTIFICATE") then return PemKind.Certificate
+    if named(name, "PRIVATE KEY") then return PemKind.PrivateKey
+    if named(name, "EC PRIVATE KEY") then return PemKind.EcPrivateKey
+    if named(name, "RSA PRIVATE KEY") then return PemKind.RsaPrivateKey
+
+    PemKind.Other
+end kind_of
+
+// Whether the C string at `p` is `s`, read without copying it.
+private named(p: *u8, s: string) -> bool
+    for i in 0..<s.len
+        if p[i] != s.bytes[i] then return false
+
+    p[s.len] == 0
+end named
+
+// Where a callback appends what BearSSL hands it: a span of caller storage and how much of it is
+// used. Bytes past the end are not written, and `over` says some arrived.
+private[bearssl] struct Sink
+    buf: *u8
+    cap: usize
+    len: usize
+    over: bool
+
+private[bearssl] sink_append(ctx: *u8, src: *u8, len: usize)
+    var s: *Sink = ptr_cast(ctx)
+
+    if s.len + len > s.cap
+        s.over = true
+        return
+
+    for i in 0..<len
+        s.buf[s.len + i] = src[i]
+
+    s.len += len
+end sink_append

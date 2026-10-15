@@ -1,0 +1,118 @@
+module sh.sysl.bearssl
+@tests
+@requires(heap, os)
+
+import sysl.encoding.hex_string
+
+// AES-GCM against the test cases of McGrew and Viega's GCM specification ("The Galois/Counter Mode of
+// Operation", the document NIST SP 800-38D adopted), and ChaCha20-Poly1305 against RFC 8439 §2.8.2.
+// Each seals the plaintext and compares ciphertext and tag byte for byte, then opens it again.
+
+gcm_case(key: string, iv: string, aad: string, plain: string, cipher: string, tag: string)
+    var data = unhex(plain)
+    var t: [16]u8 = [0; 16]
+    gcm_seal(unhex(key), unhex(iv), unhex(aad), data, t[..]).unwrap()
+    assert_eq(hex_string(data), cipher)
+    assert_eq(hex_string(t[..]), tag)
+    gcm_open(unhex(key), unhex(iv), unhex(aad), data, t[..]).unwrap()
+    assert_eq(hex_string(data), plain)
+
+val K3: string = "feffe9928665731c6d6a8f9467308308"
+val IV3: string = "cafebabefacedbaddecaf888"
+val P3: string = "d9313225f88406e5a55909c5aff5269a86a7a9531534f7da2e4c303d8a318a721c3c0c95956809532fcf0e2449a6b525b16aedf5aa0de657ba637b391aafd255"
+val P4: string = "d9313225f88406e5a55909c5aff5269a86a7a9531534f7da2e4c303d8a318a721c3c0c95956809532fcf0e2449a6b525b16aedf5aa0de657ba637b39"
+val A4: string = "feedfacedeadbeeffeedfacedeadbeefabaddad2"
+
+@test("AES-128-GCM matches the GCM specification's test cases 1 to 4")
+gcm_128_cases()
+    gcm_case("00000000000000000000000000000000", "000000000000000000000000", "", "", "", "58e2fccefa7e3061367f1d57a4e7455a")
+    gcm_case("00000000000000000000000000000000", "000000000000000000000000", "", "00000000000000000000000000000000",
+             "0388dace60b6a392f328c2b971b2fe78", "ab6e47d42cec13bdf53a67b21257bddf")
+    gcm_case(K3, IV3, "", P3,
+             "42831ec2217774244b7221b784d0d49ce3aa212f2c02a4e035c17e2329aca12e21d514b25466931c7d8f6a5aac84aa051ba30b396a0aac973d58e091473f5985",
+             "4d5c2af327cd64a62cf35abd2ba6fab4")
+    gcm_case(K3, IV3, A4, P4,
+             "42831ec2217774244b7221b784d0d49ce3aa212f2c02a4e035c17e2329aca12e21d514b25466931c7d8f6a5aac84aa051ba30b396a0aac973d58e091",
+             "5bc94fbc3221a5db94fae95ae7121a47")
+
+@test("AES-128-GCM matches test cases 5 and 6, IVs of 8 and 60 bytes")
+gcm_odd_ivs()
+    gcm_case(K3, "cafebabefacedbad", A4, P4,
+             "61353b4c2806934a777ff51fa22a4755699b2a714fcdc6f83766e5f97b6c742373806900e49f24b22b097544d4896b424989b5e1ebac0f07c23f4598",
+             "3612d2e79e3b0785561be14aaca2fccb")
+    gcm_case(K3, "9313225df88406e555909c5aff5269aa6a7a9538534f7da1e4c303d2a318a728c3c0c95156809539fcf0e2429a6b525416aedbf5a0de6a57a637b39b", A4, P4,
+             "8ce24998625615b603a033aca13fb894be9112a5c3a211a8ba262a3cca7e2ca701e4a9a4fba43c90ccdcb281d48c7c6fd62875d2aca417034c34aee5",
+             "619cc5aefffe0bfa462af43c1699d050")
+
+@test("AES-256-GCM matches test cases 13, 14 and 16")
+gcm_256_cases()
+    val zero = "0000000000000000000000000000000000000000000000000000000000000000"
+    gcm_case(zero, "000000000000000000000000", "", "", "", "530f8afbc74536b9a963b4f1c4cb738b")
+    gcm_case(zero, "000000000000000000000000", "", "00000000000000000000000000000000",
+             "cea7403d4d606b6e074ec5d3baf39d18", "d0d1c8a799996bf0265b98b5d48ab919")
+    gcm_case(s"${K3}${K3}", IV3, A4, P4,
+             "522dc1f099567d07f47f37a32a84427d643a8cdcbfe5c0c97598a2bd2555d1aa8cb08e48590dbb3da7b08b1056828838c5f61e6393ba7a0abcc9f662",
+             "76fc6ece0f4e1768cddf8853bb2d551b")
+
+@test("a GCM tag, ciphertext or AAD changed by one bit is refused, and the data is wiped")
+gcm_refuses_tampering()
+    var t: [16]u8 = [0; 16]
+    var data = unhex(P4)
+    gcm_seal(unhex(K3), unhex(IV3), unhex(A4), data, t[..]).unwrap()
+    val sealed = hex_string(data)
+    t[15] ^= 1
+    assert_eq(gcm_open(unhex(K3), unhex(IV3), unhex(A4), data, t[..]).unwrap_err().code, AUTH_FAILED)
+    for b in data
+        assert_eq(b, 0)
+    t[15] ^= 1
+    var again = unhex(sealed)
+    again[0] ^= 0x80
+    assert_eq(gcm_open(unhex(K3), unhex(IV3), unhex(A4), again, t[..]).unwrap_err().code, AUTH_FAILED)
+    var third = unhex(sealed)
+    var aad = unhex(A4)
+    aad[19] ^= 1
+    assert_eq(gcm_open(unhex(K3), unhex(IV3), aad, third, t[..]).unwrap_err().code, AUTH_FAILED)
+
+@test("GCM refuses a key of the wrong length, an empty IV and a short tag")
+gcm_refuses_lengths()
+    var t: [16]u8 = [0; 16]
+    var data: [4]u8 = [0; 4]
+    assert_eq(gcm_seal(unhex("00112233"), unhex(IV3), "".bytes, data[..], t[..]).unwrap_err().code, BAD_LENGTH)
+    assert_eq(gcm_seal(unhex(K3), "".bytes, "".bytes, data[..], t[..]).unwrap_err().code, BAD_LENGTH)
+    assert_eq(gcm_seal(unhex(K3), unhex(IV3), "".bytes, data[..], t[0..<12]).unwrap_err().code, BAD_LENGTH)
+
+val CP_KEY: string = "808182838485868788898a8b8c8d8e8f909192939495969798999a9b9c9d9e9f"
+val CP_NONCE: string = "070000004041424344454647"
+val CP_AAD: string = "50515253c0c1c2c3c4c5c6c7"
+val CP_PLAIN: string = "Ladies and Gentlemen of the class of '99: If I could offer you only one tip for the future, sunscreen would be it."
+
+@test("ChaCha20-Poly1305 matches RFC 8439 section 2.8.2, both ways")
+chacha_vector()
+    var data: []u8 = [0; CP_PLAIN.len]
+    for i in 0..<data.len
+        data[i] = CP_PLAIN.bytes[i]
+    var t: [16]u8 = [0; 16]
+    chacha20_poly1305_seal(unhex(CP_KEY), unhex(CP_NONCE), unhex(CP_AAD), data, t[..]).unwrap()
+    assert_eq(hex_string(data), "d31a8d34648e60db7b86afbc53ef7ec2a4aded51296e08fea9e2b5a736ee62d63dbea45e8ca9671282fafb69da92728b1a71de0a9e060b2905d6a5b67ecd3b3692ddbd7f2d778b8c9803aee328091b58fab324e4fad675945585808b4831d7bc3ff4def08e4b7a9de576d26586cec64b6116")
+    assert_eq(hex_string(t[..]), "1ae10b594f09e26a7e902ecbd0600691")
+    chacha20_poly1305_open(unhex(CP_KEY), unhex(CP_NONCE), unhex(CP_AAD), data, t[..]).unwrap()
+    assert_eq(hex_string(data), hex_string(CP_PLAIN.bytes))
+
+@test("a ChaCha20-Poly1305 tag or AAD changed by one bit is refused, and the data is wiped")
+chacha_refuses_tampering()
+    var data: []u8 = [0; CP_PLAIN.len]
+    for i in 0..<data.len
+        data[i] = CP_PLAIN.bytes[i]
+    var t: [16]u8 = [0; 16]
+    chacha20_poly1305_seal(unhex(CP_KEY), unhex(CP_NONCE), unhex(CP_AAD), data, t[..]).unwrap()
+    val sealed = hex_string(data)
+    t[0] ^= 1
+    assert_eq(chacha20_poly1305_open(unhex(CP_KEY), unhex(CP_NONCE), unhex(CP_AAD), data, t[..]).unwrap_err().code, AUTH_FAILED)
+    for b in data
+        assert_eq(b, 0)
+    t[0] ^= 1
+    var again = unhex(sealed)
+    var aad = unhex(CP_AAD)
+    aad[0] ^= 1
+    assert_eq(chacha20_poly1305_open(unhex(CP_KEY), unhex(CP_NONCE), aad, again, t[..]).unwrap_err().code, AUTH_FAILED)
+    assert_eq(chacha20_poly1305_seal(unhex(CP_KEY), unhex(CP_NONCE)[0..<8], "".bytes, again, t[..]).unwrap_err().code, BAD_LENGTH)

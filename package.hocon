@@ -1,0 +1,32 @@
+// BearSSL for sysl: TLS 1.2 at both ends, and the cryptography under it, bound to BearSSL 0.6
+// (bearssl.org), vendored unchanged. BearSSL never calls `malloc`: every context, buffer and key is
+// storage inside the sysl values that own it, so this is the org's TLS for boards.
+//
+// This is the block a consumer writes to reach it:
+//
+//     dependencies {
+//       bearssl { git = "github.com/sysl-lang/bearssl", version = "<the first tag>" }
+//     }
+//
+// The module is `sh.sysl.bearssl`.
+
+package {
+  name    = "bearssl"
+  version = "0.0.1"
+}
+
+// **BearSSL's tree is upstream's, byte for byte**: `c/bearssl/src` and `c/bearssl/inc` are the 0.6
+// release's own directories, and an upgrade is a copy of the next release over them.
+//
+// **No randomness is taken from the machine.** `BR_USE_URANDOM` and `BR_USE_GETENTROPY` are off, so
+// BearSSL has no source of its own and a program must hand a TLS context its seed (`seed`). On a
+// board there is no `/dev/urandom` to fall back on, and a TLS stack that silently found one on the
+// host and nothing on the board would pass every test here and fail on the hardware.
+c {
+  bearssl {
+    root    = "c/bearssl"
+    include = ["src", "inc"]
+    sources = ["src/**/*.c"]
+    defines { BR_USE_URANDOM = 0, BR_USE_GETENTROPY = 0 }
+  }
+}

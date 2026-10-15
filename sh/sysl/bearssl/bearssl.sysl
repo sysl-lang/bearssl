@@ -1,0 +1,105 @@
+// BearSSL for sysl: TLS 1.2 at both ends, and the cryptography under it.
+//
+// **Nothing here allocates.** BearSSL never calls `malloc`, and the binding keeps to that: a TLS
+// context, its I/O buffer, the certificate validator, a trust store and a server's key are all
+// storage inside the sysl values that own them, so the package runs where there is no heap.
+//
+// **The socket is the program's.** A TLS connection here is a transformer between two byte streams,
+// as in `sysl-lang/openssl`: ciphertext the program received goes in with `incoming`, ciphertext to
+// write comes out of `outgoing`, and plaintext crosses with `send` and `receive`. How bytes reach the
+// wire stays the caller's, so one binding serves a blocking socket, an event loop and a board's own
+// network stack.
+//
+// **A program must seed every TLS context itself.** The package compiles BearSSL with no source of
+// randomness of its own (`BR_USE_URANDOM` and `BR_USE_GETENTROPY` off), because a board has no
+// `/dev/urandom`; `seed` is a required step, and a context that was never seeded refuses to start.
+
+module sh.sysl.bearssl
+
+import sh.sysl.bearssl.c
+
+// What went wrong: one of BearSSL's own error numbers, or one of the binding's (1001 and up).
+//
+// **A number rather than an enum, because BearSSL's numbers are the interface.** A failed handshake
+// answers whatever the engine recorded (`X509_EXPIRED`, `X509_NOT_TRUSTED`, a received alert as
+// `RECV_FATAL_ALERT` plus its number), and a program checking for a particular one compares it with the
+// constants below.
+struct Error derives Eq
+    code: i32
+
+    // What the code means, in a few words. A static string, so reporting an error never allocates.
+    message(self) -> string
+        val k = self.code
+
+        if k >= c.ERR_SEND_FATAL_ALERT then return "a fatal alert was sent to the peer"
+        if k >= c.ERR_RECV_FATAL_ALERT then return "the peer sent a fatal alert"
+
+        k match
+            1 -> "a parameter was invalid"
+            2 -> "the call is not valid in this state"
+            7 -> "a record's MAC did not match"
+            8 -> "no randomness was injected"
+            14 -> "the handshake failed"
+            16 -> "no acceptable cipher suite"
+            27 -> "a signature did not verify"
+            31 -> "the I/O under the connection failed"
+            52 -> "a certificate's signature did not verify"
+            53 -> "the validation time is unknown"
+            54 -> "a certificate has expired or is not yet valid"
+            56 -> "the certificate does not match the server name"
+            62 -> "the certificate chain does not end at a trust anchor"
+            1001 -> "the output buffer is too small"
+            1002 -> "the store has no room left"
+            1003 -> "a key, nonce or tag is of a length the algorithm does not take"
+            1004 -> "authentication failed"
+            1005 -> "the seed is shorter than 32 bytes"
+            1006 -> "the PEM text is malformed"
+            1007 -> "the key could not be decoded"
+            1008 -> "the certificate could not be decoded"
+            _ -> if k >= c.ERR_X509_OK && k < 100 then "the certificate was refused" else "TLS failed"
+    end message
+end Error
+
+impl Display for Error
+    display(self, out: *Writer, fmt: FormatSpec) = display_str(self.message(), out, fmt)
+
+// BearSSL's error numbers a program is likely to check for.
+const OK: i32 = c.ERR_OK
+const BAD_PARAM: i32 = c.ERR_BAD_PARAM
+const BAD_STATE: i32 = c.ERR_BAD_STATE
+const BAD_MAC: i32 = c.ERR_BAD_MAC
+const NO_RANDOM: i32 = c.ERR_NO_RANDOM
+const BAD_HANDSHAKE: i32 = c.ERR_BAD_HANDSHAKE
+const BAD_CIPHER_SUITE: i32 = c.ERR_BAD_CIPHER_SUITE
+const IO_FAILED: i32 = c.ERR_IO
+const RECV_FATAL_ALERT: i32 = c.ERR_RECV_FATAL_ALERT
+const SEND_FATAL_ALERT: i32 = c.ERR_SEND_FATAL_ALERT
+const X509_BAD_SIGNATURE: i32 = c.ERR_X509_BAD_SIGNATURE
+const X509_TIME_UNKNOWN: i32 = c.ERR_X509_TIME_UNKNOWN
+const X509_EXPIRED: i32 = c.ERR_X509_EXPIRED
+const X509_BAD_SERVER_NAME: i32 = c.ERR_X509_BAD_SERVER_NAME
+const X509_NOT_TRUSTED: i32 = c.ERR_X509_NOT_TRUSTED
+
+// The binding's own refusals.
+const TOO_SMALL: i32 = 1001
+const NO_ROOM: i32 = 1002
+const BAD_LENGTH: i32 = 1003
+const AUTH_FAILED: i32 = 1004
+const SEED_TOO_SHORT: i32 = 1005
+const BAD_PEM: i32 = 1006
+const BAD_KEY: i32 = 1007
+const BAD_CERTIFICATE: i32 = 1008
+
+private[bearssl] fail[T](code: i32) -> Result[T, Error] = Err(Error(code))
+
+// Whether two byte strings are equal, in time that depends on their length only.
+private[bearssl] same(a: []const u8, b: []const u8) -> bool
+    if a.len != b.len then return false
+
+    var diff: u8 = 0
+
+    for i in 0..<a.len
+        diff |= a[i] ^ b[i]
+
+    diff == 0
+end same

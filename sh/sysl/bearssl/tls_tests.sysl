@@ -1,0 +1,249 @@
+module sh.sysl.bearssl
+@tests
+@requires(heap, os)
+
+// A BearSSL client and a BearSSL server in one process, their ciphertext carried between them by hand.
+// That is the whole protocol with no socket: the handshake, application data both ways, a clean close,
+// and every refusal a client makes, each with BearSSL's own error number. The same engine against
+// OpenSSL over real sockets is `interop_tests.sysl`.
+
+val SEED: string = "a seed of thirty-two bytes or more, fixed for the tests"
+val SERVER_SEED: string = "the server's own seed, also thirty-two bytes long"
+
+// Ciphertext in flight in one direction: what one end's `outgoing` gave and the other's `incoming` has
+// not yet taken. `tamper_at`, when not -1, is the offset of a byte flipped on the way.
+struct Pipe
+    data: [40000]u8
+    len: usize
+    tamper_at: int
+
+    fill_from[A: Connection](*self, a: *A)
+        loop
+            val n = a.outgoing(self.data[self.len..])
+            if n == 0 then break
+            if self.tamper_at >= 0 && usize(self.tamper_at) < self.len + n && usize(self.tamper_at) >= self.len
+                self.data[usize(self.tamper_at)] ^= 1
+                self.tamper_at = -1
+            self.len += n
+
+    drain_to[B: Connection](*self, b: *B)
+        var at = 0usize
+        while at < self.len
+            val k = b.incoming(self.data[at..self.len])
+            if k == 0 then break
+            at += k
+        for i in at..<self.len
+            self.data[i - at] = self.data[i]
+        self.len -= at
+
+pipe() -> Pipe = Pipe([0; 40000], 0, -1)
+
+// Move bytes both ways until both ends are ready, or one fails. The client is asked first, since a
+// refusal is the client's verdict and the server only hears of it as an alert.
+handshake[A: Connection, B: Connection](cl: *A, sv: *B, up: *Pipe, down: *Pipe) -> Result[unit, Error]
+    for _ in 0..<100
+        up.fill_from(cl)
+        up.drain_to(sv)
+        down.fill_from(sv)
+        down.drain_to(cl)
+        val a = cl.ready()?
+        val b = sv.ready()?
+        if a && b && up.len == 0 && down.len == 0 then return Ok(())
+    fail(BAD_STATE)
+
+anchors_of(pem: string) -> TrustAnchors[2, 2048]
+    var a: TrustAnchors[2, 2048] = trust_anchors()
+    a.add_pem(pem.bytes).unwrap()
+    a
+
+identity_of(pem: string) -> Identity[4096]
+    var id: Identity[4096] = identity()
+    id.add_pem(pem.bytes).unwrap()
+    id
+
+// Set both ends up over stores the caller owns, which stay put for as long as the contexts do.
+setup(cl: *Client[BUFSIZE_BIDI], sv: *Server[BUFSIZE_BIDI], anchors: *TrustAnchors[2, 2048], id: *Identity[4096])
+    cl.init(anchors)
+    cl.seed(SEED.bytes).unwrap()
+    sv.init(id).unwrap()
+    sv.seed(SERVER_SEED.bytes).unwrap()
+
+// A whole handshake: a server over `server_pem`, a client trusting `trusted` and naming `name`,
+// offering `offer` (every suite when empty) and validating at `time` (the clock when 0). Answers the
+// client's verdict and suite, and the server's error number.
+outcome(trusted: string, server_pem: string, name: string, offer: []const u16, time: i64) -> (Result[u16, Error], i32)
+    var anchors = anchors_of(trusted)
+    var id = identity_of(server_pem)
+    var cl: Client[BUFSIZE_BIDI] = client()
+    var sv: Server[BUFSIZE_BIDI] = server()
+    setup(&cl, &sv, &anchors, &id)
+    if offer.len > 0 then cl.suites(offer).unwrap()
+    if time != 0 then cl.set_time(time)
+    cl.start(name).unwrap()
+    sv.start().unwrap()
+    var up = pipe()
+    var down = pipe()
+    handshake(&cl, &sv, &up, &down) match
+        Ok(_) ->
+            assert_eq(cl.version(), TLS12)
+            assert_eq(sv.suite(), cl.suite())
+            (Ok(cl.suite()), sv.last_error())
+        Err(e) -> (Err(e), sv.last_error())
+
+// Send `text` from one end and read it at the other.
+carried[A: Connection, B: Connection](from: *A, to: *B, pipe: *Pipe, text: string) -> string
+    assert_eq(from.send(text.bytes).unwrap(), text.len)
+    pipe.fill_from(from)
+    pipe.drain_to(to)
+    var out: [256]u8 = [0; 256]
+    to.receive(out[..]).unwrap() match
+        Data(n) -> str_cast(out[0..<n])
+        Wants -> panic("nothing arrived")
+        Closed -> panic("the session closed")
+
+val EC_PEM: string = s"${EC_CERT}${EC_KEY}"
+val RSA_PEM: string = s"${RSA_KEY}${RSA_CERT}"
+
+@test("an EC server and a client handshake in memory over ECDHE-ECDSA, carry data both ways and close cleanly")
+memory_ec()
+    var anchors = anchors_of(EC_CERT)
+    var id = identity_of(EC_PEM)
+    var cl: Client[BUFSIZE_BIDI] = client()
+    var sv: Server[BUFSIZE_BIDI] = server()
+    setup(&cl, &sv, &anchors, &id)
+    cl.start("localhost").unwrap()
+    sv.start().unwrap()
+    var up = pipe()
+    var down = pipe()
+    handshake(&cl, &sv, &up, &down).unwrap()
+    assert_eq(cl.version(), TLS12)
+    assert_eq(cl.suite(), ECDHE_ECDSA_WITH_CHACHA20_POLY1305_SHA256)
+    assert_eq(sv.suite(), ECDHE_ECDSA_WITH_CHACHA20_POLY1305_SHA256)
+    assert_eq(carried(&cl, &sv, &up, "hello, server"), "hello, server")
+    assert_eq(carried(&sv, &cl, &down, "hello, client"), "hello, client")
+    cl.close()
+    up.fill_from(&cl)
+    up.drain_to(&sv)
+    // The server answers the close-notify with its own, and is closed once that has been taken.
+    var out: [16]u8 = [0; 16]
+    assert(sv.receive(out[..]).unwrap() == Received.Wants)
+    down.fill_from(&sv)
+    assert(down.len > 0)
+    assert(sv.receive(out[..]).unwrap() == Received.Closed)
+    down.drain_to(&cl)
+    assert(cl.receive(out[..]).unwrap() == Received.Closed)
+    assert_eq(cl.last_error(), OK)
+
+@test("an RSA server handshakes over ECDHE-RSA")
+memory_rsa()
+    val (verdict, _) = outcome(RSA_CERT, RSA_PEM, "localhost", [], 0)
+    assert_eq(verdict.unwrap(), ECDHE_RSA_WITH_CHACHA20_POLY1305_SHA256)
+
+@test("a client offering only one suite gets it: AES-128-GCM, AES-256-GCM, at either kind of key")
+memory_suites()
+    val (a, _) = outcome(EC_CERT, EC_PEM, "localhost", [ECDHE_ECDSA_WITH_AES_128_GCM_SHA256], 0)
+    assert_eq(a.unwrap(), ECDHE_ECDSA_WITH_AES_128_GCM_SHA256)
+    val (r, _) = outcome(RSA_CERT, RSA_PEM, "localhost", [ECDHE_RSA_WITH_AES_128_GCM_SHA256], 0)
+    assert_eq(r.unwrap(), ECDHE_RSA_WITH_AES_128_GCM_SHA256)
+    val (b, _) = outcome(RSA_CERT, RSA_PEM, "localhost", [ECDHE_RSA_WITH_AES_256_GCM_SHA384], 0)
+    assert_eq(b.unwrap(), ECDHE_RSA_WITH_AES_256_GCM_SHA384)
+    val (d, _) = outcome(EC_CERT, EC_PEM, "localhost", [ECDHE_ECDSA_WITH_AES_256_GCM_SHA384], 0)
+    assert_eq(d.unwrap(), ECDHE_ECDSA_WITH_AES_256_GCM_SHA384)
+
+@test("a server certificate under the wrong trust anchor is refused with X509_NOT_TRUSTED")
+memory_wrong_anchor()
+    val (verdict, _) = outcome(OTHER_CERT, EC_PEM, "localhost", [], 0)
+    assert_eq(verdict.unwrap_err().code, X509_NOT_TRUSTED)
+
+@test("an expired server certificate is refused with X509_EXPIRED, though it is the trust anchor itself")
+memory_expired()
+    val (verdict, _) = outcome(EXPIRED_CERT, s"${EXPIRED_CERT}${EC_KEY}", "localhost", [], 0)
+    assert_eq(verdict.unwrap_err().code, X509_EXPIRED)
+
+@test("the validation time a client is given decides: 2200 and 2025 are refused, 2030 is accepted")
+memory_set_time()
+    val (late, _) = outcome(EC_CERT, EC_PEM, "localhost", [], 7258118400)
+    assert_eq(late.unwrap_err().code, X509_EXPIRED)
+    val (early, _) = outcome(EC_CERT, EC_PEM, "localhost", [], 1735689600)
+    assert_eq(early.unwrap_err().code, X509_EXPIRED)
+    val (fine, _) = outcome(EC_CERT, EC_PEM, "localhost", [], 1893456000)
+    fine.unwrap()
+
+@test("a certificate for another name is refused with X509_BAD_SERVER_NAME")
+memory_server_name()
+    val (verdict, _) = outcome(EC_CERT, EC_PEM, "example.com", [], 0)
+    assert_eq(verdict.unwrap_err().code, X509_BAD_SERVER_NAME)
+
+@test("a client offering only suites the server's key cannot use is refused, and the server says why")
+memory_no_common_suite()
+    val (verdict, server_error) = outcome(EC_CERT, EC_PEM, "localhost", [ECDHE_RSA_WITH_AES_128_GCM_SHA256], 0)
+    assert_eq(verdict.unwrap_err().code, RECV_FATAL_ALERT + 40)
+    assert_eq(server_error, SEND_FATAL_ALERT + 40)
+
+@test("a record changed in flight is refused with BAD_MAC")
+memory_tampered()
+    var anchors = anchors_of(EC_CERT)
+    var id = identity_of(EC_PEM)
+    var cl: Client[BUFSIZE_BIDI] = client()
+    var sv: Server[BUFSIZE_BIDI] = server()
+    setup(&cl, &sv, &anchors, &id)
+    cl.start("localhost").unwrap()
+    sv.start().unwrap()
+    var up = pipe()
+    var down = pipe()
+    handshake(&cl, &sv, &up, &down).unwrap()
+    up.tamper_at = 20
+    assert_eq(cl.send("this record is changed on the way".bytes).unwrap(), 33)
+    up.fill_from(&cl)
+    up.drain_to(&sv)
+    var out: [64]u8 = [0; 64]
+    assert_eq(sv.receive(out[..]).unwrap_err().code, BAD_MAC)
+
+@test("a context never seeded refuses to start with BearSSL's NO_RANDOM, and a short seed with SEED_TOO_SHORT")
+memory_seed_required()
+    var anchors = anchors_of(EC_CERT)
+    var cl: Client[BUFSIZE_BIDI] = client()
+    assert_eq(cl.start("localhost").unwrap_err().code, BAD_STATE)
+    assert_eq(cl.seed(SEED.bytes).unwrap_err().code, BAD_STATE)
+    cl.init(&anchors)
+    assert_eq(cl.start("localhost").unwrap_err().code, NO_RANDOM)
+    var short: Client[BUFSIZE_BIDI] = client()
+    short.init(&anchors)
+    short.seed(SEED.bytes[0..<31]).unwrap()
+    assert_eq(short.start("localhost").unwrap_err().code, SEED_TOO_SHORT)
+    short.seed(SEED.bytes[31..<32]).unwrap()
+    short.start("localhost").unwrap()
+    var id = identity_of(EC_PEM)
+    var sv: Server[BUFSIZE_BIDI] = server()
+    sv.init(&id).unwrap()
+    assert_eq(sv.start().unwrap_err().code, NO_RANDOM)
+    var out: [8]u8 = [0; 8]
+    assert_eq(sv.send("x".bytes).unwrap_err().code, BAD_STATE)
+    assert_eq(sv.receive(out[..]).unwrap_err().code, BAD_STATE)
+    assert_eq(sv.outgoing(out[..]), 0)
+
+@test("a server with no certificate, or no key, refuses to be set up")
+memory_server_needs_identity()
+    var empty: Identity[1024] = identity()
+    var sv: Server[BUFSIZE_BIDI] = server()
+    assert_eq(sv.init(&empty).unwrap_err().code, BAD_CERTIFICATE)
+    var keyless = identity_of(EC_CERT)
+    assert_eq(sv.init(&keyless).unwrap_err().code, BAD_KEY)
+
+@test("a half-duplex buffer of BUFSIZE_MONO at both ends carries a whole exchange")
+memory_mono()
+    var anchors = anchors_of(EC_CERT)
+    var id = identity_of(EC_PEM)
+    var cl: Client[BUFSIZE_MONO] = client()
+    var sv: Server[BUFSIZE_MONO] = server()
+    cl.init(&anchors)
+    cl.seed(SEED.bytes).unwrap()
+    sv.init(&id).unwrap()
+    sv.seed(SERVER_SEED.bytes).unwrap()
+    cl.start("localhost").unwrap()
+    sv.start().unwrap()
+    var up = pipe()
+    var down = pipe()
+    handshake(&cl, &sv, &up, &down).unwrap()
+    assert_eq(carried(&cl, &sv, &up, "mono"), "mono")
+    assert_eq(carried(&sv, &cl, &down, "back"), "back")

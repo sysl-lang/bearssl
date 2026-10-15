@@ -1,0 +1,335 @@
+// TLS 1.2, client and server, over BearSSL's engine.
+//
+// **The binding never sees a socket.** A connection is BearSSL's engine plus its I/O buffer, and four
+// calls move bytes across it:
+//
+//   - `outgoing(out)` takes ciphertext the engine wants written to the peer;
+//   - `incoming(bytes)` hands it ciphertext that arrived from the peer;
+//   - `send(plaintext)` and `receive(out)` move application data once the handshake is done.
+//
+// The loop a caller writes, over whatever carries its bytes:
+//
+//     loop
+//         drain `outgoing` to the wire until it answers 0
+//         if `ready()?` then break                      // or: send / receive
+//         if `wants_input()` then read from the wire and give it to `incoming`
+//
+// **Drain before reading, every time.** The engine produces bytes to send from reading as well as
+// from writing (a handshake reply, an alert, a close-notify), and a loop that blocks on the wire
+// while bytes sit in `outgoing` waits for a peer that is waiting for it.
+//
+// **Setting a context up is four explicit steps, in order** — `init`, then `seed` and any options,
+// then `start` — because BearSSL's `init` zeroes the context, so anything set before it is lost.
+//
+// **A context must stay where it is from `init` on.** BearSSL keeps pointers into it (its buffer, its
+// validator, its own record state), so a copy taken afterwards is a context BearSSL knows nothing
+// about. On a board it is module storage. (sysl's coming `@pinned` will refuse such a copy.)
+
+module sh.sysl.bearssl
+
+import sh.sysl.bearssl.c
+import sysl.slices.{as_mut_ptr, as_ptr, copy}
+
+private const CLIENT_WORDS: usize = (c.CLIENT_SIZE + 7) / 8
+private const SERVER_WORDS: usize = (c.SERVER_SIZE + 7) / 8
+private const X509_MIN_WORDS: usize = (c.X509_MIN_SIZE + 7) / 8
+
+// The I/O buffer for a connection that sends and receives at once: room for one full record each way.
+const BUFSIZE_BIDI: usize = c.BUFSIZE_BIDI
+
+// The I/O buffer for a half-duplex connection: one record, used for both directions in turn. About
+// 16 KB, which is what a board with little RAM can afford.
+const BUFSIZE_MONO: usize = c.BUFSIZE_MONO
+
+// The least seed a context accepts: 32 bytes, what BearSSL's HMAC_DRBG needs for its full strength.
+const MIN_SEED: usize = 32
+
+// TLS 1.2's cipher suites that BearSSL implements with forward secrecy and an AEAD.
+const ECDHE_ECDSA_WITH_AES_128_GCM_SHA256: u16 = 0xC02B
+const ECDHE_ECDSA_WITH_AES_256_GCM_SHA384: u16 = 0xC02C
+const ECDHE_RSA_WITH_AES_128_GCM_SHA256: u16 = 0xC02F
+const ECDHE_RSA_WITH_AES_256_GCM_SHA384: u16 = 0xC030
+const ECDHE_RSA_WITH_CHACHA20_POLY1305_SHA256: u16 = 0xCCA8
+const ECDHE_ECDSA_WITH_CHACHA20_POLY1305_SHA256: u16 = 0xCCA9
+
+// The protocol version numbers `version` answers.
+const TLS10: u32 = c.TLS10
+const TLS12: u32 = c.TLS12
+
+// What `receive` found.
+enum Received derives Eq
+    // This many bytes of plaintext were written into the buffer.
+    Data(n: usize)
+
+    // Nothing yet: the engine needs more input (or has output to drain) first.
+    Wants
+
+    // The peer closed the session cleanly with a close-notify. **Distinct from the socket ending**,
+    // which the caller sees and this cannot: a stream that stops with no close-notify is a truncation
+    // and is the caller's to treat as one.
+    Closed
+end Received
+
+// What a client and a server share: the engine, and every call that moves bytes through it.
+trait Connection
+    // The engine. **Not for programs**: it is how the calls below reach BearSSL.
+    engine(*self) -> *c.Engine
+
+    // Whether `start` has been called and has not failed.
+    started(*self) -> bool
+
+    // Take ciphertext to be written to the peer into `out`, and answer how much. **Call it until it
+    // answers 0, after every other call.**
+    outgoing(*self, out: []u8) -> usize
+        val e = self.engine()
+
+        if !self.started() || c.engine_current_state(e) & c.SSL_SENDREC == 0 then return 0
+
+        var avail = 0usize
+        val buf = c.engine_sendrec_buf(e, &avail)
+        val n = if out.len < avail then out.len else avail
+
+        copy(out, buf[0..<n])
+        c.engine_sendrec_ack(e, n)
+        n
+    end outgoing
+
+    // Whether the engine is waiting for ciphertext from the peer.
+    wants_input(*self) -> bool =
+        self.started() && c.engine_current_state(self.engine()) & c.SSL_RECVREC != 0
+
+    // Hand over ciphertext that arrived from the peer, and answer how much was taken. **It may be less
+    // than all of it**: the engine takes at most what fits in its buffer, and the rest is offered again
+    // after `outgoing` and `receive` have made room.
+    incoming(*self, bytes: []const u8) -> usize
+        val e = self.engine()
+
+        if !self.wants_input() then return 0
+
+        var room = 0usize
+        val buf = c.engine_recvrec_buf(e, &room)
+        val n = if bytes.len < room then bytes.len else room
+
+        copy(buf[0..<n], bytes[0..<n])
+        c.engine_recvrec_ack(e, n)
+        n
+    end incoming
+
+    // Whether the handshake is done and application data may flow. A failed or closed connection
+    // answers its error.
+    ready(*self) -> Result[bool, Error]
+        if !self.started() then return fail(BAD_STATE)
+
+        val state = c.engine_current_state(self.engine())
+
+        if state & c.SSL_CLOSED != 0 then return Err(failure_of(self.engine()))
+
+        Ok(state & (c.SSL_SENDAPP | c.SSL_RECVAPP) != 0)
+    end ready
+
+    // Give the peer some plaintext, and answer how much was taken: 0 while the engine cannot take any
+    // (during the handshake, or with its output buffer full). What was taken is sealed into a record at
+    // once, ready for `outgoing`.
+    send(*self, plaintext: []const u8) -> Result[usize, Error]
+        val e = self.engine()
+
+        if !self.started() then return fail(BAD_STATE)
+
+        val state = c.engine_current_state(e)
+
+        if state & c.SSL_CLOSED != 0 then return Err(failure_of(self.engine()))
+        if state & c.SSL_SENDAPP == 0 then return Ok(0)
+
+        var room = 0usize
+        val buf = c.engine_sendapp_buf(e, &room)
+        val n = if plaintext.len < room then plaintext.len else room
+
+        copy(buf[0..<n], plaintext[0..<n])
+        c.engine_sendapp_ack(e, n)
+        c.engine_flush(e, 0)
+        Ok(n)
+    end send
+
+    // Take whatever plaintext has arrived.
+    receive(*self, out: []u8) -> Result[Received, Error]
+        val e = self.engine()
+
+        if !self.started() then return fail(BAD_STATE)
+
+        val state = c.engine_current_state(e)
+
+        if state & c.SSL_RECVAPP != 0
+            var avail = 0usize
+            val buf = c.engine_recvapp_buf(e, &avail)
+            val n = if out.len < avail then out.len else avail
+
+            copy(out, buf[0..<n])
+            c.engine_recvapp_ack(e, n)
+            return Ok(Received.Data(n))
+
+        if state & c.SSL_CLOSED != 0
+            if c.engine_last_error(e) == c.ERR_OK then return Ok(Received.Closed)
+
+            return Err(failure_of(self.engine()))
+
+        Ok(Received.Wants)
+    end receive
+
+    // Begin closing: a close-notify is queued for `outgoing`, and the connection ends when the peer's
+    // arrives.
+    close(*self) = c.engine_close(self.engine())
+
+    // BearSSL's error number for the connection: 0 while it is healthy or after a clean close.
+    last_error(*self) -> i32 = c.engine_last_error(self.engine())
+
+    // The cipher suite the handshake settled on (one of the constants above), or 0 before it is done.
+    suite(*self) -> u16 = u16(c.engine_cipher_suite(self.engine()))
+
+    // The protocol version the handshake settled on (`TLS12`), or 0 before it is done.
+    version(*self) -> u32 = c.engine_version(self.engine())
+end Connection
+
+// The error a closed engine recorded; a context closed with none was used after it ended.
+private failure_of(e: *c.Engine) -> Error
+    val k = c.engine_last_error(e)
+
+    Error(if k == c.ERR_OK then BAD_STATE else k)
+end failure_of
+
+// The state common to both ends: whether `init` and `start` ran, and how much seed went in.
+private[bearssl] struct Setup
+    initialized: bool
+    seeded: usize
+    running: bool
+
+// Seed an initialized engine, adding to whatever was injected before.
+private[bearssl] seed_engine(e: *c.Engine, s: *Setup, entropy: []const u8) -> Result[unit, Error]
+    if !s.initialized then return fail(BAD_STATE)
+
+    c.engine_inject_entropy(e, as_ptr(entropy), entropy.len)
+    s.seeded += entropy.len
+    Ok(())
+end seed_engine
+
+private[bearssl] suites_engine(e: *c.Engine, s: *Setup, list: []const u16) -> Result[unit, Error]
+    if !s.initialized || s.running then return fail(BAD_STATE)
+    if list.len == 0 then return fail(BAD_PARAM)
+
+    c.engine_set_suites(e, as_ptr(list), list.len)
+    Ok(())
+end suites_engine
+
+// The checks `start` makes before BearSSL's reset. **No seed at all is left to BearSSL to refuse**, so
+// the refusal a program sees for it is BearSSL's own `NO_RANDOM`; a seed that is merely short is the
+// binding's refusal, since BearSSL would accept a single byte.
+private[bearssl] ready_to_start(s: *Setup) -> Result[unit, Error]
+    if !s.initialized then return fail(BAD_STATE)
+    if s.seeded > 0 && s.seeded < MIN_SEED then return fail(SEED_TOO_SHORT)
+
+    Ok(())
+end ready_to_start
+
+// A TLS client, with an I/O buffer of `IO` bytes (`BUFSIZE_BIDI` or `BUFSIZE_MONO`).
+struct Client[const IO: usize]
+    private cc: [CLIENT_WORDS]u64
+    private xc: [X509_MIN_WORDS]u64
+    private io: [IO]u8
+    private name: [256]u8
+    private setup: Setup
+
+    // Set the client up to validate servers against `anchors`, with every TLS 1.2 suite BearSSL has.
+    // **`anchors` must outlive the client and stay where it is**: the validator keeps its address.
+    init[const N: usize, const B: usize](*self, anchors: *TrustAnchors[N, B])
+        c.ssl_client_init_full(self.ctx(), self.validator(), anchors.anchors(), anchors.len())
+        c.engine_set_versions(self.engine(), c.TLS12, c.TLS12)
+        c.engine_set_buffer(self.engine(), &self.io[0], IO, if IO >= BUFSIZE_BIDI then 1 else 0)
+        self.setup = Setup(true, 0, false)
+    end init
+
+    // Inject seed entropy: at least `MIN_SEED` bytes in all, from a real source (a hardware generator
+    // on a board, the OS's on a host). **Required**: a client that was never seeded refuses to start.
+    seed(*self, entropy: []const u8) -> Result[unit, Error] = seed_engine(self.engine(), &self.setup, entropy)
+
+    // Offer only these cipher suites, in this order of preference.
+    suites(*self, list: []const u16) -> Result[unit, Error] = suites_engine(self.engine(), &self.setup, list)
+
+    // Validate certificates as of this moment, in seconds since 1970, instead of the machine's clock.
+    // **A board has no clock to fall back on**, and a client there that never sets one refuses every
+    // certificate with `X509_TIME_UNKNOWN`.
+    set_time(*self, unix_seconds: i64)
+        val days = u32(719528 + unix_seconds / 86400)
+        val seconds = u32(unix_seconds % 86400)
+
+        c.x509_minimal_set_time(self.validator(), days, seconds)
+    end set_time
+
+    // Begin a handshake with the server named `server_name`, which its certificate must match.
+    start(*self, server_name: string) -> Result[unit, Error]
+        ready_to_start(&self.setup)?
+
+        if server_name.len >= 256 then return fail(BAD_PARAM)
+
+        copy(self.name[..], server_name.bytes)
+        self.name[server_name.len] = 0
+
+        if c.ssl_client_reset(self.ctx(), &self.name[0], 0) == 0
+            return Err(Error(c.engine_last_error(self.engine())))
+
+        self.setup.running = true
+        Ok(())
+    end start
+
+    private ctx(*self) -> *c.ClientCtx = ptr_cast(&self.cc[0])
+
+    private validator(*self) -> *c.X509Minimal = ptr_cast(&self.xc[0])
+end Client
+
+impl[const IO: usize] Connection for Client[IO]
+    engine(*self) -> *c.Engine = ptr_cast(&self.cc[0])
+    started(*self) -> bool = self.setup.running
+
+// A fresh client, not yet set up.
+client[const IO: usize]() -> Client[IO] =
+    Client([0; CLIENT_WORDS], [0; X509_MIN_WORDS], [0; IO], [0; 256], Setup(false, 0, false))
+
+// A TLS server, with an I/O buffer of `IO` bytes.
+struct Server[const IO: usize]
+    private sc: [SERVER_WORDS]u64
+    private io: [IO]u8
+    private setup: Setup
+
+    // Set the server up to present `identity`, with every TLS 1.2 suite its key allows. **`identity`
+    // must outlive the server and stay where it is.**
+    init[const B: usize](*self, identity: *Identity[B]) -> Result[unit, Error]
+        identity.install(self.ctx())?
+        c.engine_set_versions(self.engine(), c.TLS12, c.TLS12)
+        c.engine_set_buffer(self.engine(), &self.io[0], IO, if IO >= BUFSIZE_BIDI then 1 else 0)
+        self.setup = Setup(true, 0, false)
+        Ok(())
+    end init
+
+    // Inject seed entropy, as for a client. **Required.**
+    seed(*self, entropy: []const u8) -> Result[unit, Error] = seed_engine(self.engine(), &self.setup, entropy)
+
+    // Accept only these cipher suites, in this order of preference.
+    suites(*self, list: []const u16) -> Result[unit, Error] = suites_engine(self.engine(), &self.setup, list)
+
+    // Wait for a client's hello.
+    start(*self) -> Result[unit, Error]
+        ready_to_start(&self.setup)?
+
+        if c.ssl_server_reset(self.ctx()) == 0 then return Err(Error(c.engine_last_error(self.engine())))
+
+        self.setup.running = true
+        Ok(())
+    end start
+
+    private ctx(*self) -> *c.ServerCtx = ptr_cast(&self.sc[0])
+end Server
+
+impl[const IO: usize] Connection for Server[IO]
+    engine(*self) -> *c.Engine = ptr_cast(&self.sc[0])
+    started(*self) -> bool = self.setup.running
+
+// A fresh server, not yet set up.
+server[const IO: usize]() -> Server[IO] = Server([0; SERVER_WORDS], [0; IO], Setup(false, 0, false))
