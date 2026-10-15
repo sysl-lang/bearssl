@@ -1,0 +1,44 @@
+# What vendoring BearSSL found in sysl
+
+Found against the prerelease of sysl's `vendored-c` branch (3ffffa28), meant for alpha.14. BearSSL's
+`src/` and `inc/` are vendored unchanged.
+
+## 1. `build-lib` compiles the package's own shim without the `c` block's include roots (bug)
+
+`shim.c` (needed because 16 BearSSL functions are `static inline`) fails under `build-lib` on the host
+and on a board: `shim.c:7:10: fatal error: 'bearssl.h' file not found`. `test` and `build` give the shim
+the roots, as packages.md says they must. The same bug lwIP found (its FINDINGS 1).
+
+## 2. No way to hand BearSSL a `libc = true` package's headers (gap)
+
+On a freestanding target BearSSL's headers include `<string.h>`. Nothing delivers cstd's:
+- cstd has no `c { libc }` block or tag yet;
+- `build-lib` refuses a `dependencies` block, and its advice "supply 'cstd' as --lib" fails even when
+  `--lib` is given;
+- a `--lib` root overriding a coordinate drops its exports (`'<cstd>' is no package of the graph`, and
+  `takes  from 0 package(s)`, a word missing from the message);
+- a board's `cstd { path }` does not satisfy bearssl's coordinate, which is fetched instead.
+Wanted: a `--lib` override that counts as the package it overrides, and target-only dependencies.
+
+## 3. A failed `c const` probe is buried under its consequences (rough edge)
+
+A board build shows `the value of 'AES_CTR_WORDS' is not a constant expression … showing the first 5 of
+167 errors`. The cause, `the C compiler refused this file's 'c const' block: 'string.h' file not found`,
+is among the 162 not shown, and no flag shows them. The same as lwIP's FINDINGS 6.
+
+## 4. Whole-aggregate loads and stores make clang's time grow quadratically (compiler bug)
+
+A struct literal built from by-value calls emits whole-aggregate `load`/`store` of the struct:
+`struct Big { data: [33000]u8, n: int }` and `two() -> &Two = Two(big(), big())` takes 74 s to build,
+against 4 s at `[8000]u8`. A test helper with four such fields sat in clang for over 22 minutes. The tests
+set contexts up as separate locals meanwhile, a reshaping to be undone when this is fixed.
+
+## Smaller
+
+5. Every `@tests` file of one module must state identical `@requires`, so `(heap, os)` is repeated in
+   all eight.
+6. A library's `include` roots also serve the package's own shim and probes, so those see BearSSL's
+   private `src/` headers. There is no root kept private to the library's own files.
+7. An accessor returning a slice of self takes `*self`, so each match arm copies the value first.
+
+**Status: reported to `sysl`.**
