@@ -1,0 +1,50 @@
+module sh.sysl.bearssl
+@tests
+@requires(heap, os)
+
+// BearSSL on a board. The package takes cstd as its C library with `if = "!libc"`, so for a
+// bare-metal target the vendored C is compiled against cstd's headers and the archive carries cstd's
+// definitions of the libc functions BearSSL calls.
+
+import sysl.buf.{Buf, buf}
+import sysl.env.get_or
+import sysl.fs.make_dir_all
+import sysl.process.capture
+import sysl.testing.{compiler, skip}
+import sysl.text.split
+
+// BearSSL's own entry points, and the libc functions its C calls.
+private val own: []string = ["br_sha256_init", "br_ssl_client_init_full"]
+private val called: []string = ["memcpy", "memset", "strlen"]
+
+// The global symbols the archive `build-c` writes for this package defines, one name per line.
+private bare_defines(target: string) -> string
+    if get_or("SYSL_EXTRA_CFLAGS", "") != ""
+        skip("SYSL_EXTRA_CFLAGS would reach the bare-metal build")
+    val dir = f".sysl/bare-tests/$target"
+    make_dir_all(dir).unwrap()
+    val lib = f"$dir/libbearssl.a"
+    var args: Buf[string] = buf()
+    for a in ["build-c", ".", "-o", lib, "--target", target] do args.push(a)
+    val built = capture(compiler(), args.view(), stderr = true).unwrap()
+    if !built.status.ok() then panic(f"build-c for $target failed:\n${built.err.unwrap_or("")}")
+    val listed = capture("nm", ["-g", lib]).unwrap()
+    assert(listed.status.ok())
+    var defined = "\n"
+    for line in split(listed.text, "\n")
+        val t = line.index_of(" T ")
+        if t.is_some() then defined += f"${line[t.unwrap() + 3..<line.len]}\n"
+    defined
+
+private bare_case(target: string)
+    val defined = bare_defines(target)
+    for n in own
+        if !defined.contains(f"\n$n\n") then panic(f"$target: the archive does not define $n")
+    for n in called
+        if !defined.contains(f"\n$n\n") then panic(f"$target: the archive does not define $n, so cstd was not its libc")
+
+@test("on thumbv7em BearSSL builds against cstd and the archive defines what it calls")
+bare_thumbv7em() = bare_case("thumbv7em-freestanding")
+
+@test("on riscv32 BearSSL builds against cstd and the archive defines what it calls")
+bare_riscv32() = bare_case("riscv32-freestanding")

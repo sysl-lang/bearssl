@@ -9,11 +9,11 @@ where [`sysl-lang/openssl`](https://github.com/sysl-lang/openssl) will not fit.
 
 ```hocon
 dependencies {
-  bearssl { git = "github.com/sysl-lang/bearssl", version = "0.1.0" }
+  bearssl { git = "github.com/sysl-lang/bearssl", version = "0.1.1" }
 }
 ```
 
-The module is `sh.sysl.bearssl`. The package needs sysl 0.1.1 (the vendored-C manifest block, `@pinned`).
+The module is `sh.sysl.bearssl`. The package needs sysl 0.1.2 (the vendored-C manifest block, `@pinned`).
 
 ## A TLS client over a socket the program owns
 
@@ -100,7 +100,7 @@ RSA-OAEP and PSS, RSA key generation, AES-CCM and EAX, SHAKE and MD5, the AES-NI
 
 ## Tests
 
-`sysl test .` runs 54 tests. Two oracles decide them, neither of which is BearSSL.
+`sysl test .` runs 56 tests. Two oracles decide them, neither of which is BearSSL.
 
 **The standards' own vectors**, byte for byte: FIPS 180-2's SHA examples ("abc", the 448- and 896-bit
 messages, a million "a") and CAVP's empty message for all five SHA widths; RFC 4231 test cases 1, 2, 3
@@ -140,12 +140,11 @@ binary links `__asan_memcpy` and the report hooks, and BearSSL's own functions
 
 ## Bare metal
 
-BearSSL needs no allocator and no operating system, and the binding asks for neither. On a freestanding
-target its headers still need a C library's (`<string.h>`), which `sysl-lang/cstd` is for, and sysl
-cannot yet hand them to this package: cstd carries no `libc` block, a dependency cannot be taken on
-some targets only, and `build-lib` does not give this package's own C its include roots. Until sysl
-closes those, `sysl build-lib . --target thumb-freestanding` stops at `'string.h' file not
-found`. With `--include-path <cstd>/include` every layout measures on `thumb-freestanding`.
+BearSSL needs no allocator and no operating system, and the binding asks for neither. The package
+builds for boards with `sysl-lang/cstd` as its C library (`cstd { ..., if = "!libc" }`: where the
+machine has a libc the dependency is dropped). The suite builds the package with `sysl build-c` for
+`thumbv7em-freestanding` and `riscv32-freestanding` and checks with `nm` that the archive defines
+BearSSL's entry points and cstd's `memcpy`, `memset` and `strlen`. It needs sysl 0.1.2 or later.
 
 ## Vendored
 

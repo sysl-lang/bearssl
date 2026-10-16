@@ -9,7 +9,7 @@ Found against the prerelease of sysl's `vendored-c` branch (3ffffa28), meant for
 and on a board: `shim.c:7:10: fatal error: 'bearssl.h' file not found`. `test` and `build` give the shim
 the roots, as packages.md says they must. The same bug lwIP found (its FINDINGS 1).
 
-## 2. No way to hand BearSSL a `libc = true` package's headers (gap)
+## 2. No way to hand BearSSL a `libc = true` package's headers (gap) — FIXED in sysl 0.1.2 (`if = "!libc"`, cstd v0.1.0)
 
 On a freestanding target BearSSL's headers include `<string.h>`. Nothing delivers cstd's:
 - cstd has no `c { libc }` block or tag yet;
@@ -48,8 +48,8 @@ session is one pinned struct built from four by-value constructors again.
 - vendored-c round 2 covers 1, 3 and 6 (`include_private`). **Built and adopted** against edb75ec4:
   1 (`build-lib` host passes), 6 (`src` is `include_private`; the shim and probes need only `inc/`,
   54 tests plain and ASan pass). Still rough: 3 (a refused probe quotes clang's one error, but the sysl
-  errors around it still print, 38 in all, and the clang error is not first among them). `build-lib
-  --target thumbv7em-freestanding` stops on `'string.h' file not found`, the expected libc gap (2).
+  errors around it still print, 38 in all, and the clang error is not first among them). The libc gap
+  (2) is closed: `build-c . --target thumbv7em-freestanding` and `riscv32-freestanding` pass with cstd.
 - `lib-override` and `target-deps` cover 2.
 - `aggregate-copy` covers 4: large copies become memcpy or sret.
 - `tests-files` covers 5.
