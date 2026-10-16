@@ -51,15 +51,11 @@ handshake[A: Connection, B: Connection](cl: *A, sv: *B, up: *Pipe, down: *Pipe) 
         if a && b && up.len == 0 && down.len == 0 then return Ok(())
     fail(BAD_STATE)
 
-anchors_of(pem: string) -> TrustAnchors[2, 2048]
-    var a: TrustAnchors[2, 2048] = trust_anchors()
+trust(a: *TrustAnchors[2, 2048], pem: string)
     a.add_pem(pem.bytes).unwrap()
-    a
 
-identity_of(pem: string) -> Identity[4096]
-    var id: Identity[4096] = identity()
+load(id: *Identity[4096], pem: string)
     id.add_pem(pem.bytes).unwrap()
-    id
 
 // Set both ends up over stores the caller owns, which stay put for as long as the contexts do.
 setup(cl: *Client[BUFSIZE_BIDI], sv: *Server[BUFSIZE_BIDI], anchors: *TrustAnchors[2, 2048], id: *Identity[4096])
@@ -68,22 +64,38 @@ setup(cl: *Client[BUFSIZE_BIDI], sv: *Server[BUFSIZE_BIDI], anchors: *TrustAncho
     sv.init(id).unwrap()
     sv.seed(SERVER_SEED.bytes).unwrap()
 
+// Both ends of a connection with the stores they validate against, built in place and set up over
+// each other. The stores stay put for as long as the contexts do, because the value is pinned.
+@pinned
+struct Session
+    anchors: TrustAnchors[2, 2048]
+    id: Identity[4096]
+    cl: Client[BUFSIZE_BIDI]
+    sv: Server[BUFSIZE_BIDI]
+
+session() -> Session = Session(trust_anchors(), identity(), client(), server())
+
+// Trust `trusted`, serve `server_pem`, and set both ends up.
+open(s: *Session, trusted: string, server_pem: string)
+    trust(&s.anchors, trusted)
+    load(&s.id, server_pem)
+    setup(&s.cl, &s.sv, &s.anchors, &s.id)
+
 // A whole handshake: a server over `server_pem`, a client trusting `trusted` and naming `name`,
 // offering `offer` (every suite when empty) and validating at `time` (the clock when 0). Answers the
 // client's verdict and suite, and the server's error number.
 outcome(trusted: string, server_pem: string, name: string, offer: []const u16, time: i64) -> (Result[u16, Error], i32)
-    var anchors = anchors_of(trusted)
-    var id = identity_of(server_pem)
-    var cl: Client[BUFSIZE_BIDI] = client()
-    var sv: Server[BUFSIZE_BIDI] = server()
-    setup(&cl, &sv, &anchors, &id)
+    var s: Session = session()
+    open(&s, trusted, server_pem)
+    val cl = &s.cl
+    val sv = &s.sv
     if offer.len > 0 then cl.suites(offer).unwrap()
     if time != 0 then cl.set_time(time)
     cl.start(name).unwrap()
     sv.start().unwrap()
     var up = pipe()
     var down = pipe()
-    handshake(&cl, &sv, &up, &down) match
+    handshake(cl, sv, &up, &down) match
         Ok(_) ->
             assert_eq(cl.version(), TLS12)
             assert_eq(sv.suite(), cl.suite())
@@ -106,31 +118,30 @@ val RSA_PEM: string = s"${RSA_KEY}${RSA_CERT}"
 
 @test("an EC server and a client handshake in memory over ECDHE-ECDSA, carry data both ways and close cleanly")
 memory_ec()
-    var anchors = anchors_of(EC_CERT)
-    var id = identity_of(EC_PEM)
-    var cl: Client[BUFSIZE_BIDI] = client()
-    var sv: Server[BUFSIZE_BIDI] = server()
-    setup(&cl, &sv, &anchors, &id)
+    var s: Session = session()
+    open(&s, EC_CERT, EC_PEM)
+    val cl = &s.cl
+    val sv = &s.sv
     cl.start("localhost").unwrap()
     sv.start().unwrap()
     var up = pipe()
     var down = pipe()
-    handshake(&cl, &sv, &up, &down).unwrap()
+    handshake(cl, sv, &up, &down).unwrap()
     assert_eq(cl.version(), TLS12)
     assert_eq(cl.suite(), ECDHE_ECDSA_WITH_CHACHA20_POLY1305_SHA256)
     assert_eq(sv.suite(), ECDHE_ECDSA_WITH_CHACHA20_POLY1305_SHA256)
-    assert_eq(carried(&cl, &sv, &up, "hello, server"), "hello, server")
-    assert_eq(carried(&sv, &cl, &down, "hello, client"), "hello, client")
+    assert_eq(carried(cl, sv, &up, "hello, server"), "hello, server")
+    assert_eq(carried(sv, cl, &down, "hello, client"), "hello, client")
     cl.close()
-    up.fill_from(&cl)
-    up.drain_to(&sv)
+    up.fill_from(cl)
+    up.drain_to(sv)
     // The server answers the close-notify with its own, and is closed once that has been taken.
     var out: [16]u8 = [0; 16]
     assert(sv.receive(out[..]).unwrap() == Received.Wants)
-    down.fill_from(&sv)
+    down.fill_from(sv)
     assert(down.len > 0)
     assert(sv.receive(out[..]).unwrap() == Received.Closed)
-    down.drain_to(&cl)
+    down.drain_to(cl)
     assert(cl.receive(out[..]).unwrap() == Received.Closed)
     assert_eq(cl.last_error(), OK)
 
@@ -182,26 +193,26 @@ memory_no_common_suite()
 
 @test("a record changed in flight is refused with BAD_MAC")
 memory_tampered()
-    var anchors = anchors_of(EC_CERT)
-    var id = identity_of(EC_PEM)
-    var cl: Client[BUFSIZE_BIDI] = client()
-    var sv: Server[BUFSIZE_BIDI] = server()
-    setup(&cl, &sv, &anchors, &id)
+    var s: Session = session()
+    open(&s, EC_CERT, EC_PEM)
+    val cl = &s.cl
+    val sv = &s.sv
     cl.start("localhost").unwrap()
     sv.start().unwrap()
     var up = pipe()
     var down = pipe()
-    handshake(&cl, &sv, &up, &down).unwrap()
+    handshake(cl, sv, &up, &down).unwrap()
     up.tamper_at = 20
     assert_eq(cl.send("this record is changed on the way".bytes).unwrap(), 33)
-    up.fill_from(&cl)
-    up.drain_to(&sv)
+    up.fill_from(cl)
+    up.drain_to(sv)
     var out: [64]u8 = [0; 64]
     assert_eq(sv.receive(out[..]).unwrap_err().code, BAD_MAC)
 
 @test("a context never seeded refuses to start with BearSSL's NO_RANDOM, and a short seed with SEED_TOO_SHORT")
 memory_seed_required()
-    var anchors = anchors_of(EC_CERT)
+    var anchors: TrustAnchors[2, 2048] = trust_anchors()
+    trust(&anchors, EC_CERT)
     var cl: Client[BUFSIZE_BIDI] = client()
     assert_eq(cl.start("localhost").unwrap_err().code, BAD_STATE)
     assert_eq(cl.seed(SEED.bytes).unwrap_err().code, BAD_STATE)
@@ -213,7 +224,8 @@ memory_seed_required()
     assert_eq(short.start("localhost").unwrap_err().code, SEED_TOO_SHORT)
     short.seed(SEED.bytes[31..<32]).unwrap()
     short.start("localhost").unwrap()
-    var id = identity_of(EC_PEM)
+    var id: Identity[4096] = identity()
+    load(&id, EC_PEM)
     var sv: Server[BUFSIZE_BIDI] = server()
     sv.init(&id).unwrap()
     assert_eq(sv.start().unwrap_err().code, NO_RANDOM)
@@ -227,13 +239,16 @@ memory_server_needs_identity()
     var empty: Identity[1024] = identity()
     var sv: Server[BUFSIZE_BIDI] = server()
     assert_eq(sv.init(&empty).unwrap_err().code, BAD_CERTIFICATE)
-    var keyless = identity_of(EC_CERT)
+    var keyless: Identity[4096] = identity()
+    load(&keyless, EC_CERT)
     assert_eq(sv.init(&keyless).unwrap_err().code, BAD_KEY)
 
 @test("a half-duplex buffer of BUFSIZE_MONO at both ends carries a whole exchange")
 memory_mono()
-    var anchors = anchors_of(EC_CERT)
-    var id = identity_of(EC_PEM)
+    var anchors: TrustAnchors[2, 2048] = trust_anchors()
+    trust(&anchors, EC_CERT)
+    var id: Identity[4096] = identity()
+    load(&id, EC_PEM)
     var cl: Client[BUFSIZE_MONO] = client()
     var sv: Server[BUFSIZE_MONO] = server()
     cl.init(&anchors)

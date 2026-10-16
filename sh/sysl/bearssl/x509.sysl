@@ -23,6 +23,7 @@ private[bearssl] blank_anchor() -> c.TrustAnchor = c.TrustAnchor(null, 0, 0, c.P
 //
 // **An anchor is a name and a key, not a certificate.** BearSSL keeps only what validation needs, so a
 // self-signed certificate of a few hundred bytes costs its subject name and its public key here.
+@pinned
 struct TrustAnchors[const N: usize, const BYTES: usize]
     private list: [N]c.TrustAnchor
     private count: usize
@@ -30,7 +31,7 @@ struct TrustAnchors[const N: usize, const BYTES: usize]
     private used: usize
 
     // How many anchors are held.
-    len(self) -> usize = self.count
+    len(*self) -> usize = self.count
 
     // Trust the certificate `der`.
     add_der(*self, der: []const u8) -> Result[unit, Error]
@@ -136,6 +137,7 @@ private[bearssl] feed_x509(ctx: *u8, src: *u8, len: usize) = c.x509_decoder_push
 //
 // **The key is held in BearSSL's own decoder**, which is where BearSSL's server code expects to find
 // it, so it is never copied out into a second place.
+@pinned
 struct Identity[const BYTES: usize]
     private chain: [MAX_CHAIN]c.Certificate
     private count: usize
@@ -146,7 +148,7 @@ struct Identity[const BYTES: usize]
     private issuer_key_type: i32
 
     // How many certificates the chain holds.
-    len(self) -> usize = self.count
+    len(*self) -> usize = self.count
 
     // Append the certificate `der` to the chain. The first one added is the server's own.
     add_certificate(*self, der: []const u8) -> Result[unit, Error]

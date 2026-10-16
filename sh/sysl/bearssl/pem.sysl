@@ -39,6 +39,7 @@ end PemKind
 //
 // **It must stay where it is once `next` has been called**: BearSSL's decoder keeps pointers into its
 // own stacks, which live inside this value.
+@pinned
 struct PemReader
     private dec: [PEM_WORDS]u64
     private text: []const u8

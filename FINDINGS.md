@@ -31,7 +31,10 @@ is among the 162 not shown, and no flag shows them. The same as lwIP's FINDINGS 
 A struct literal built from by-value calls emits whole-aggregate `load`/`store` of the struct:
 `struct Big { data: [33000]u8, n: int }` and `two() -> &Two = Two(big(), big())` takes 74 s to build,
 against 4 s at `[8000]u8`. A test helper with four such fields sat in clang for over 22 minutes. The tests
-set contexts up as separate locals meanwhile, a reshaping to be undone when this is fixed.
+set contexts up as separate locals meanwhile.
+
+**Status: Fixed in sysl 0.1.x; workaround removed.** The reduction builds in 0.8 s on 0.1.1, and the test
+session is one pinned struct built from four by-value constructors again.
 
 ## Smaller
 
@@ -51,4 +54,5 @@ set contexts up as separate locals meanwhile, a reshaping to be undone when this
 - `aggregate-copy` covers 4: large copies become memcpy or sret.
 - `tests-files` covers 5.
 
-The separate-locals reshape from 4 comes out when alpha.14 ships.
+The separate-locals reshape from 4 is undone (sysl 0.1.1). 7 is not reproduced as a copy but is still open:
+an accessor handing back a slice of a `self` array is refused on 0.1.1 as outliving its frame.

@@ -9,11 +9,11 @@ where [`sysl-lang/openssl`](https://github.com/sysl-lang/openssl) will not fit.
 
 ```hocon
 dependencies {
-  bearssl { git = "github.com/sysl-lang/bearssl", version = "<the first tag>" }
+  bearssl { git = "github.com/sysl-lang/bearssl", version = "0.1.0" }
 }
 ```
 
-The module is `sh.sysl.bearssl`. The package needs sysl's vendored-C manifest block (alpha.14).
+The module is `sh.sysl.bearssl`. The package needs sysl 0.1.1 (the vendored-C manifest block, `@pinned`).
 
 ## A TLS client over a socket the program owns
 
@@ -52,8 +52,8 @@ drained after each. **Drain before reading**: the engine produces bytes to send 
 from writing, and a loop that blocks on the wire while bytes sit in `outgoing` waits forever.
 
 **A context must stay where it is from `init` on**, and so must the `TrustAnchors` or `Identity` it was
-set up over: BearSSL keeps pointers into all of them. On a board they are module storage. sysl's coming
-`@pinned` will refuse a copy; until then it is a rule the program keeps.
+set up over: BearSSL keeps pointers into all of them. On a board they are module storage. `Client`, `Server`,
+`TrustAnchors`, `Identity` and `PemReader` are `@pinned`, so sysl refuses a copy or a move.
 
 A server is the same with `Server[IO]`, `Identity[BYTES]` (a certificate chain and its private key,
 from PEM or DER, EC or RSA) and `start()` with no name. `BUFSIZE_BIDI` (about 33 KB) carries both
@@ -144,7 +144,7 @@ BearSSL needs no allocator and no operating system, and the binding asks for nei
 target its headers still need a C library's (`<string.h>`), which `sysl-lang/cstd` is for, and sysl
 cannot yet hand them to this package: cstd carries no `libc` block, a dependency cannot be taken on
 some targets only, and `build-lib` does not give this package's own C its include roots. Until sysl
-alpha.14 closes those, `sysl build-lib . --target thumb-freestanding` stops at `'string.h' file not
+closes those, `sysl build-lib . --target thumb-freestanding` stops at `'string.h' file not
 found`. With `--include-path <cstd>/include` every layout measures on `thumb-freestanding`.
 
 ## Vendored

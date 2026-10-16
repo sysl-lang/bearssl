@@ -23,7 +23,7 @@
 //
 // **A context must stay where it is from `init` on.** BearSSL keeps pointers into it (its buffer, its
 // validator, its own record state), so a copy taken afterwards is a context BearSSL knows nothing
-// about. On a board it is module storage. (sysl's coming `@pinned` will refuse such a copy.)
+// about. On a board it is module storage. (`@pinned` makes sysl refuse such a copy.)
 
 module sh.sysl.bearssl
 
@@ -230,6 +230,7 @@ private[bearssl] ready_to_start(s: *Setup) -> Result[unit, Error]
 end ready_to_start
 
 // A TLS client, with an I/O buffer of `IO` bytes (`BUFSIZE_BIDI` or `BUFSIZE_MONO`).
+@pinned
 struct Client[const IO: usize]
     private cc: [CLIENT_WORDS]u64
     private xc: [X509_MIN_WORDS]u64
@@ -293,6 +294,7 @@ client[const IO: usize]() -> Client[IO] =
     Client([0; CLIENT_WORDS], [0; X509_MIN_WORDS], [0; IO], [0; 256], Setup(false, 0, false))
 
 // A TLS server, with an I/O buffer of `IO` bytes.
+@pinned
 struct Server[const IO: usize]
     private sc: [SERVER_WORDS]u64
     private io: [IO]u8
