@@ -17,7 +17,7 @@ package {
 
 // On a board there is no libc, so cstd supplies one; where the machine has a libc the dependency is dropped.
 dependencies {
-  cstd { git = "github.com/sysl-lang/cstd", version = "0.1.0", if = "!libc" }
+  cstd { git = "github.com/sysl-lang/cstd", version = "0.1.4", if = "!libc" }
 }
 
 // **BearSSL's tree is upstream's, byte for byte**: `c/bearssl/src` and `c/bearssl/inc` are the 0.6
