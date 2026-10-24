@@ -9,7 +9,7 @@ where [`sysl-lang/openssl`](https://github.com/sysl-lang/openssl) will not fit.
 
 ```hocon
 dependencies {
-  bearssl { git = "github.com/sysl-lang/bearssl", version = "0.1.1" }
+  bearssl { git = "github.com/sysl-lang/bearssl", version = "0.1.2" }
 }
 ```
 

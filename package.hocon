@@ -5,14 +5,14 @@
 // This is the block a consumer writes to reach it:
 //
 //     dependencies {
-//       bearssl { git = "github.com/sysl-lang/bearssl", version = "0.1.1" }
+//       bearssl { git = "github.com/sysl-lang/bearssl", version = "0.1.2" }
 //     }
 //
 // The module is `sh.sysl.bearssl`.
 
 package {
   name    = "bearssl"
-  version = "0.1.1"
+  version = "0.1.2"
 }
 
 // On a board there is no libc, so cstd supplies one; where the machine has a libc the dependency is dropped.
