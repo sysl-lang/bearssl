@@ -5,6 +5,7 @@ module sh.sysl.bearssl
 import sysl.fs.{exists, make_temp_dir, read_text, remove_dir_all, write_text}
 import sysl.net.{Socket, resolve, socket}
 import sysl.process.{Spawned, Stdio, capture, spawn}
+import sysl.text.parse_int
 import sysl.time.{millis, sleep}
 
 // BearSSL against an independent implementation over real TCP sockets: the host's `openssl` (OpenSSL 3
@@ -36,25 +37,39 @@ make_cert(dir: string, name: string, kind: string)
         run_openssl(["req", "-x509", "-key", key, "-subj", "/CN=localhost", "-addext", "subjectAltName=DNS:localhost",
                      "-days", "2", "-sha256", "-out", crt])
 
-// A port nothing is listening on now: bound once with port 0 and released.
-free_port() -> int
-    val addr = resolve("127.0.0.1", 0).unwrap()[0]
-    var s = socket(addr).unwrap()
-    s.bind(addr).unwrap()
-    val port = s.local().unwrap().port()
-    s.close().unwrap()
-    port
+// How long a wait for a started process may take: 60 s. A loaded machine (the org census runs dozens of
+// test processes at once) has been seen to need over 10 s to start `openssl s_server`.
+val wait_steps = 600
+
+// The port `openssl s_server -accept 127.0.0.1:0` bound, which it reports as `ACCEPT 127.0.0.1:<port>` on
+// stdout once it is listening. The OS chose the port, so nothing else can have taken it.
+server_port(dir: string) -> int
+    for _ in 0..<wait_steps
+        if exists(s"${dir}/s_server.out")
+            val text = read_text(s"${dir}/s_server.out").unwrap()
+            text.index_of("ACCEPT ") match
+                Some(at) ->
+                    val rest = text[at..]
+                    rest.index_of("\n") match
+                        Some(nl) ->
+                            val line = rest[0..<nl]
+                            val colon = line.last_index_of(":").unwrap()
+                            return parse_int(line[colon + 1..]).unwrap()
+                        None -> ()
+                None -> ()
+        sleep(millis(100))
+    panic("openssl s_server never reported the port it listens on")
 
 // Connect to a server that may still be starting.
 connect_to(port: int) -> Socket
     val addr = resolve("127.0.0.1", port).unwrap()[0]
-    for _ in 0..<200
+    for _ in 0..<wait_steps
         var s = socket(addr).unwrap()
         if s.connect(addr).is_ok()
-            s.read_timeout(10000).unwrap()
+            s.read_timeout(30000).unwrap()
             return s
         s.close().unwrap()
-        sleep(millis(50))
+        sleep(millis(100))
     panic(s"nothing came to listen on port ${port}")
 
 // Write everything the engine has for the wire.
@@ -115,10 +130,10 @@ stop(p: &Spawned)
 // The BearSSL client against `openssl s_server` presenting `<name>.crt`, trusting `trusted.crt`.
 // Answers the handshake's verdict, and on success the suite and the reversed line.
 client_run(dir: string, name: string, trusted: string, offer: []const u16) -> Result[(u16, string), Error]
-    val port = free_port()
-    val server = spawn(openssl(), ["s_server", "-accept", s"${port}", "-cert", s"${dir}/${name}.crt", "-key",
+    val server = spawn(openssl(), ["s_server", "-accept", "127.0.0.1:0", "-cert", s"${dir}/${name}.crt", "-key",
                                    s"${dir}/${name}.key", "-tls1_2", "-rev", "-naccept", "1"],
                        stdout = Stdio.ToPath(s"${dir}/s_server.out"), stderr = Stdio.ToPath(s"${dir}/s_server.err")).unwrap()
+    val port = server_port(dir)
     var sock = connect_to(port)
     var anchors: TrustAnchors[2, 4096] = trust_anchors()
     anchors.add_pem(read_text(s"${dir}/${trusted}.crt").unwrap().bytes).unwrap()
@@ -177,12 +192,12 @@ client_refuses_openssl()
 // The BearSSL server presenting `<name>.crt` to `openssl s_client` trusting `trusted.crt`. Answers the
 // server's handshake verdict and suite, what s_client printed, and whether it exited cleanly.
 server_run(dir: string, name: string, trusted: string, cipher: string) -> (Result[u16, Error], string, bool)
-    val port = free_port()
-    val addr = resolve("127.0.0.1", port).unwrap()[0]
+    val addr = resolve("127.0.0.1", 0).unwrap()[0]
     var listener = socket(addr).unwrap()
     listener.reuse_address().unwrap()
     listener.bind(addr).unwrap()
     listener.listen().unwrap()
+    val port = listener.local().unwrap().port()
     write_text(s"${dir}/in.txt", "ping from openssl\n").unwrap()
     var args: []string = ["s_client", "-connect", s"127.0.0.1:${port}", "-CAfile", s"${dir}/${trusted}.crt",
                           "-verify_return_error", "-verify_hostname", "localhost", "-servername", "localhost",
@@ -210,12 +225,12 @@ server_run(dir: string, name: string, trusted: string, cipher: string) -> (Resul
     sock.close().unwrap()
     var p = peer
     var clean = false
-    for _ in 0..<100
+    for _ in 0..<wait_steps
         p.try_wait().unwrap() match
             Some(st) ->
                 clean = st.ok()
                 break
-            None -> sleep(millis(50))
+            None -> sleep(millis(100))
     p.kill(9)
     p.wait()
     listener.close().unwrap()
