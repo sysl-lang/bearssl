@@ -2,6 +2,8 @@ module sh.sysl.bearssl
 @tests
 @requires(heap, os)
 
+import sysl.raw.str_cast
+
 // A BearSSL client and a BearSSL server in one process, their ciphertext carried between them by hand.
 // That is the whole protocol with no socket: the handshake, application data both ways, a clean close,
 // and every refusal a client makes, each with BearSSL's own error number. The same engine against

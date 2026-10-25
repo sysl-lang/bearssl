@@ -5,6 +5,7 @@ module sh.sysl.bearssl
 import sysl.fs.{exists, make_temp_dir, read_text, remove_dir_all, write_text}
 import sysl.net.{Socket, resolve, socket}
 import sysl.process.{Spawned, Stdio, capture, spawn}
+import sysl.raw.str_cast
 import sysl.text.parse_int
 import sysl.time.{millis, sleep}
 

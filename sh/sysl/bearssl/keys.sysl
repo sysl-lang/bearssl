@@ -10,6 +10,7 @@
 module sh.sysl.bearssl
 
 import sh.sysl.bearssl.c
+import sysl.raw.ptr_cast
 import sysl.slices.{as_mut_ptr, as_ptr, copy}
 
 // The longest scalar and point of any curve here, P-521's.

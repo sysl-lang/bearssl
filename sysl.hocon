@@ -5,19 +5,20 @@
 // This is the block a consumer writes to reach it:
 //
 //     dependencies {
-//       bearssl { git = "github.com/sysl-lang/bearssl", version = "0.1.2" }
+//       bearssl { git = "github.com/sysl-lang/bearssl", version = "0.1.3" }
 //     }
 //
 // The module is `sh.sysl.bearssl`.
 
 package {
   name    = "bearssl"
-  version = "0.1.2"
+  version = "0.1.3"
+  sysl    = "0.6.0"
 }
 
 // On a board there is no libc, so cstd supplies one; where the machine has a libc the dependency is dropped.
 dependencies {
-  cstd { git = "github.com/sysl-lang/cstd", version = "0.1.4", if = "!libc" }
+  cstd { git = "github.com/sysl-lang/cstd", version = "0.1.7", if = "!libc" }
 }
 
 // **BearSSL's tree is upstream's, byte for byte**: `c/bearssl/src` and `c/bearssl/inc` are the 0.6

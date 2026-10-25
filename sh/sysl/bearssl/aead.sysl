@@ -11,6 +11,7 @@
 module sh.sysl.bearssl
 
 import sh.sysl.bearssl.c
+import sysl.raw.ptr_cast
 import sysl.slices.{as_mut_ptr, as_ptr, fill}
 
 private const AES_CTR_WORDS: usize = (c.AES_CTR_SIZE + 7) / 8

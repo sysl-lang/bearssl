@@ -9,6 +9,7 @@
 module sh.sysl.bearssl
 
 import sh.sysl.bearssl.c
+import sysl.raw.ptr_cast
 import sysl.slices.{as_ptr, copy}
 
 private[bearssl] const X509_DEC_WORDS: usize = (c.X509_DEC_SIZE + 7) / 8

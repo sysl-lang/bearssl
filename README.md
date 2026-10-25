@@ -9,11 +9,11 @@ where [`sysl-lang/openssl`](https://github.com/sysl-lang/openssl) will not fit.
 
 ```hocon
 dependencies {
-  bearssl { git = "github.com/sysl-lang/bearssl", version = "0.1.2" }
+  bearssl { git = "github.com/sysl-lang/bearssl", version = "0.1.3" }
 }
 ```
 
-The module is `sh.sysl.bearssl`. The package needs sysl 0.1.2 (the vendored-C manifest block, `@pinned`).
+The module is `sh.sysl.bearssl`. The package needs sysl 0.6.0.
 
 ## A TLS client over a socket the program owns
 
@@ -144,13 +144,13 @@ BearSSL needs no allocator and no operating system, and the binding asks for nei
 builds for boards with `sysl-lang/cstd` as its C library (`cstd { ..., if = "!libc" }`: where the
 machine has a libc the dependency is dropped). The suite builds the package with `sysl build-c` for
 `thumbv7em-freestanding` and `riscv32-freestanding` and checks with `nm` that the archive defines
-BearSSL's entry points and cstd's `memcpy`, `memset` and `strlen`. It needs sysl 0.1.2 or later.
+BearSSL's entry points and cstd's `memcpy`, `memset` and `strlen`. It needs sysl 0.6.0 or later.
 
 ## Vendored
 
 `c/bearssl/src` and `c/bearssl/inc` are BearSSL 0.6's own directories, unchanged, with its
 `LICENSE.txt`, from the tarball whose SHA-256 is
-`6705bba1714961b41a728dfc5debbe348d2966c117649392f8c8139efc83ff14`. `package.hocon`'s `c` block compiles
+`6705bba1714961b41a728dfc5debbe348d2966c117649392f8c8139efc83ff14`. `sysl.hocon`'s `c` block compiles
 `src/**/*.c` (277 files) with `BR_USE_URANDOM=0` and `BR_USE_GETENTROPY=0`; an upgrade is a copy of the
 next release over the tree. Vendoring means upstream fixes do not arrive on their own: watch
 bearssl.org and re-vendor.

@@ -7,6 +7,7 @@
 module sh.sysl.bearssl
 
 import sh.sysl.bearssl.c
+import sysl.raw.ptr_cast
 import sysl.slices.{as_mut_ptr, as_ptr}
 
 private const PEM_WORDS: usize = (c.PEM_SIZE + 7) / 8
